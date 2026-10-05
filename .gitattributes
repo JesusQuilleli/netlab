@@ -1,0 +1,17 @@
+# Ficheros de texto siempre con LF.
+#
+# Sin esto, un clon en Windows con core.autocrlf=true deja los scripts de bash,
+# las unidades de systemd y las configuraciones de nginx con CRLF, y en Ubuntu
+# fallan con errores del tipo "\r: command not found". netlab se despliega en
+# Linux, asi que LF en todas partes.
+
+* text=auto eol=lf
+
+# Los PDF y los PNG son binarios: si git los tratara como texto los corromperia.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.eml text eol=lf

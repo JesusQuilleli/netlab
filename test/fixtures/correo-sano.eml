@@ -1,0 +1,31 @@
+Return-Path: <bounce@ejemplo.com>
+Received: from mail.ejemplo.com (mail.ejemplo.com [93.184.216.34])
+	by mx.receptor.com with ESMTPS id abc123
+	for <usuario@destino.com>; Tue, 1 Oct 2026 10:00:00 +0000
+Authentication-Results: mx.receptor.com;
+	spf=pass smtp.mailfrom=ejemplo.com;
+	dkim=pass header.d=ejemplo.com header.s=default;
+	dmarc=pass header.from=ejemplo.com
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=ejemplo.com;
+	s=default; h=from:to:subject;
+	bh=abcdefghijklmnopqrstuvwxyz
+From: Ejemplo <noreply@ejemplo.com>
+To: usuario@destino.com
+Subject: Tu pedido ya va en camino
+Message-ID: <xyz@ejemplo.com>
+Date: Tue, 1 Oct 2026 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BOUND"
+List-Unsubscribe: <mailto:baja@ejemplo.com>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+
+--BOUND
+Content-Type: text/plain; charset="utf-8"
+
+Hola, tu pedido numero 42 ya va en camino y llegara manana a primera hora.
+Gracias por comprar con nosotros.
+--BOUND
+Content-Type: text/html; charset="utf-8"
+
+<html><body><p>Hola, tu pedido numero 42 ya va en camino y llegara manana a primera hora.</p><p>Gracias por comprar con nosotros.</p></body></html>
+--BOUND--

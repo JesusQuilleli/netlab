@@ -1,0 +1,27 @@
+{
+  "name": "netlab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Panel de diagnostico de red, DNS, IP y correo. Suite de herramientas centralizada con interfaz web, CLI e informes.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/server/index.js",
+    "serve": "node src/server/index.js",
+    "build": "npm --prefix web run build",
+    "dev:api": "node --watch src/server/index.js",
+    "dev:web": "npm --prefix web run dev",
+    "test": "node --test \"test/*.test.js\"",
+    "test:web": "npm --prefix web test",
+    "test:all": "npm run test && npm run test:web",
+    "hash-password": "node src/cli/hash-password.js",
+    "manual": "node src/cli/manual.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "nodemailer": "^6.9.16",
+    "pdfkit": "^0.15.1"
+  }
+}

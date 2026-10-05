@@ -1,0 +1,38 @@
+# Dependencias
+node_modules/
+
+# Build de la interfaz. Se compila en la VPS (`npm run build`) en vez de
+# versionarlo: un distViejo en el repo es la forma facil de desplegar una
+# interfaz que ya no corresponde con el codigo del servidor.
+web/dist/
+
+# Secretos -- NUNCA versionar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Credenciales que alguien ha dejado en un .txt suelto. Las claves de Spamhaus
+# llegan asi, en un fichero que dice "Query Key" y el numero debajo, y no es un
+# sitio donde suene a secreto a simple vista.
+*[Cc]lave*.txt
+*[Kk]ey*.txt
+*secret*.txt
+*credencial*.txt
+
+# Datos de runtime (base de datos + reportes generados)
+data/
+
+# Salidas de pruebas manuales (PDF generados fuera de data/)
+mejoras-module-correos/
+
+# Proyectos antiguos congelados (contienen credenciales en texto plano)
+legacy/
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

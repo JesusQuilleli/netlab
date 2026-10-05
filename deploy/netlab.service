@@ -1,0 +1,72 @@
+# Servicio systemd para netlab.
+#
+# Instalar en la VPS:
+#   sudo cp deploy/netlab.service /etc/systemd/system/netlab.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now netlab
+#
+# Compruebe que ARRANCA con el usuario y la ruta correctos antes de dar por
+# bueno el despliegue: si el usuario no existe, el servicio entra en bucle de
+# fallos y no sera el unico sintoma.
+
+[Unit]
+Description=netlab - consola de diagnostico de red, DNS, IP y correo
+Documentation=https://github.com/JesusQuilleli/netlab
+# netlab diagnostica por su cuenta (DNS, TCP, TLS), asi que no depende de la red
+# para arrancar: se levanta igual sin ella y muestra el error en el informe.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Usuario de servicio dedicado. Sin este bloque el proceso correría como root,
+# y una app web reachable desde Internet como root es un problema esperando.
+User=netlab
+Group=netlab
+
+# Ajuste estas dos rutas a donde clonó el repositorio.
+WorkingDirectory=/opt/netlab
+ExecStart=/usr/bin/node src/server/index.js
+
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/netlab/.env
+
+Restart=on-failure
+RestartSec=5
+# Si se reinicia en bucle (por ejemplo, .env con un error de sintaxis), para
+# después de 10 intentos en 5 minutos en vez de quedarse reiniciando siempre.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# --- Aislamiento ---------------------------------------------------------
+# Son las directrices de systemd para que un proceso nocomprometa la maquina si
+# algo se explota. No hacen falta para que netlab funcione, pero no hay motivo
+# para dejar el servidor sin ellas.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# netlab escribe en data/ (base de datos, historial, informes) y necesita leer
+# todo lo demás. ReadWritePaths es lo que permite escribir con ProtectSystem=strict.
+ReadWritePaths=/opt/netlab/data
+
+# Diagnosticos: ping, traceroute y sondas TCP necesitan salir a Internet.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=any
+
+# El manual PDF se genera en memoria y se escribe en data/. Si el limite de
+# memoria le pisa, el informe falla con un error poco descriptivo.
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

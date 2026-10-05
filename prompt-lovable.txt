@@ -1,0 +1,293 @@
+Netlab — consola unificada de diagnóstico (red + correo)
+=====================================================
+
+Reescribe por completo el frontend de una aplicación web que ya tiene su
+backend funcionando. Quiero UNA sola interfaz que centralice las seis
+micro-apps que hoy viven separadas, no seis formularios sueltos.
+
+
+REGLA CERO: EL BACKEND YA EXISTE, NO LO TOQUES
+----------------------------------------------
+
+- El backend es un servidor Node/Express propio que corre en
+  http://127.0.0.1:4310. No generes backend, no uses Supabase, no uses mocks,
+  no inventes endpoints. Todo dato que veas en pantalla tiene que venir de
+  esas llamadas.
+- Configura el proxy de Vite para que /api vaya a http://127.0.0.1:4310 y
+  reenvíe cookies (changeOrigin, secure: false). Trabaja con rutas relativas
+  /api/...
+- Si una llamada no existe, no la simules: degrada con un estado vacío
+  honesto.
+
+
+API DISPONIBLE (CONTRATO EXACTO)
+--------------------------------
+
+  GET     /api/sesion
+          -> { autenticado, local, usuario, modoTextoPlano, csrf,
+               herramientas, avisos[] }
+
+  GET     /api/herramientas
+          -> { herramientas: Herramienta[], avisos[] }
+
+  POST    /api/run
+          -> { id, duplicado, avisos[], result }
+          body: { tool, params }
+
+  GET     /api/run/:id
+          -> { id, duplicado, avisos[], result, registro }
+
+  GET     /api/run/:id/:formato
+          -> descarga el informe
+
+  GET     /api/historial
+          -> { items: HistorialItem[], total, limite, desde }
+
+  DELETE  /api/historial/:id
+
+  GET     /api/formats
+          -> { formatos: [{ nombre, mime }] }
+
+  GET     /api/config
+
+- POST /api/run exige la cabecera X-CSRF-Token con el valor de csrf que
+  devuelve GET /api/sesion. Todas las peticiones van con
+  credentials: 'include'.
+- Si /api/sesion dice autenticado: false, muestra pantalla de acceso y haz
+  POST /api/sesion con { usuario, password }. Si local: true, entras directo.
+
+
+ESQUEMA DE "HERRAMIENTA" (EL CATÁLOGO)
+---------------------------------------
+
+  type Campo = {
+    name: string;
+    label: string;
+    type: 'text' | 'number' | 'password' | 'select' | 'checkbox' | 'file';
+    required?: boolean;
+    requiredUnless?: string;   // requerido solo si ese campo NO está activo
+    placeholder?: string;
+    help?: string;
+    default?: unknown;
+    min?: number;
+    max?: number;
+    options?: { valor: string; etiqueta: string }[];
+    shownWhen?: string;        // el campo depende del valor de otro
+    accept?: string;
+    maxBytes?: number;
+  };
+
+  type Herramienta = {
+    id: string;
+    titulo: string;
+    descripcion: string;
+    icon: string;              // emoji corto; no lo uses como única señal
+    sinRed: boolean;           // si es true, la herramienta funciona sin internet
+    campos: Campo[];
+  };
+
+Las seis: dns-checker, ip-audit, ip-abuse, subnet-analyzer, mail-checker,
+smtp-validator.
+
+Los formularios se generan a partir de campos. No escribas un componente por
+herramienta: escribe un DynamicForm genérico que respete shownWhen,
+requiredUnless, default, min/max, options, type y help. Si una herramienta
+necesita un campo extra, está en campos; si de verdad falta algo, agrégalo como
+caso genérico por name, no como if/else por tool.
+
+
+ESQUEMA DE "RESULT" (EL INFORME)
+--------------------------------
+
+  type Tone = 'ok' | 'warn' | 'bad' | 'neutral';
+
+  type Celda = {
+    valor: string | number;
+    tone?: Tone;
+  };
+
+  type Seccion = {
+    id?: string;
+    title: string;
+    description?: string | null;
+    kind: 'table' | 'kv' | 'code' | 'text' | 'list' | 'meter';
+    // tabla:    columns: string[]
+    //           rows: (string | Celda[])[]
+    // kv:       items: [string, string | number | Celda][]
+    // code/text: value: string
+    // list:     items: string[]
+    // meter:    value: number (0-100), tone?: Tone
+    //           si no viene tone, se deriva del valor
+    tone?: Tone;
+    anchoColumnas?: number[] | null;
+  };
+
+  type Result = {
+    schema: number;
+    tool: string;
+    toolTitle: string;
+    status: 'pass' | 'warn' | 'fail' | 'error';
+    target: string;
+    params: Record<string, unknown>;
+    summary: { label: string; value: string; tone: Tone }[];
+    sections: Seccion[];
+    findings: {
+      severity: 'info' | 'warn' | 'error';
+      title: string;
+      detail: string;
+      remediation?: string;
+    }[];
+    logs: { level: string; message: string; at?: string }[];
+    startedAt: string;
+    durationMs: number;
+    error: { code: string; message: string; remediation?: string } | null;
+  };
+
+Un solo renderizador para las seis herramientas: SeccionRenderer debe cubrir
+los seis kind y no conocer ninguna herramienta.
+
+
+ESQUEMA DE "ITEM DE HISTORIAL"
+------------------------------
+
+  type HistorialItem = {
+    id: string;
+    tool: string;
+    target: string;
+    status: 'pass' | 'warn' | 'fail' | 'error';
+    params: Record<string, unknown>;
+    createdAt: string;
+    durationMs: number;
+    owner: string;
+  };
+
+
+ARQUITECTURA QUE QUIERO
+-----------------------
+
+  src/
+    lib/        api.ts (fetch + CSRF + errores), tipos.ts,
+                formato.ts (fechas, bytes, duración)
+    hooks/      useSesion, useHerramientas, useHistorial,
+                useEjecucion (con cancelación)
+    components/
+      layout/     AppShell, Sidebar, TopBar, CommandPalette
+      form/       DynamicForm, Campo (text|number|password|select|
+                  checkbox|file), FormActions
+      informe/    StatusBadge, SummaryCards, FindingsList,
+                  SeccionRenderer, TablaSection, KvSection,
+                  CodeSection, ListSection, MeterSection, LogViewer
+      historial/  HistoryList, HistoryDetail
+    routes/     HerramientaPage, HistorialPage, ConfigPage
+
+
+SHELL Y NAVEGACIÓN
+------------------
+
+- Sidebar con las seis herramientas agrupadas por dominio (Red / Correo),
+  cada una con su icono, título y descripción corta. Estado activo claro.
+- Command palette con Ctrl/Cmd+K: busca herramienta por nombre y busca en el
+  historial por target. Es la vía rápida para quien usa esto a diario.
+- Historial como vista de primera clase, no un afterthought: buscador por
+  texto (target y params), filtro por herramienta y por status, y recarga de
+  una ejecución anterior con un clic (GET /api/run/:id).
+- Al abrir una ejecución, el formulario se rellena con registro.params.
+- Barra de estado con el indicador de sesión y el origen de datos.
+
+
+EJECUCIÓN
+---------
+
+- Estado por ejecución: inactivo / ejecutando (con esqueleto o shimmer) /
+  listo / error.
+- AbortController para cancelar; un diagnóstico de DNS puede tardar y el
+  usuario tiene que poder salir. Aborta también el fetch.
+- Errores: error llega como { code, message, remediation }. Muestra message
+  prominentemente y remediation como texto de ayuda, nunca como error rojo
+  genérico.
+- avisos[] de la respuesta: muéstralos como avisos no bloqueantes, distintos
+  de los findings.
+
+
+INFORME
+-------
+
+- Cabecera: toolTitle, target, StatusBadge (pass=correcto,
+  warn=con observaciones, fail=con fallos, error=error), duración y fecha.
+- summary como fila de tarjetas compactas con el tone respetado.
+- findings agrupadas por severidad, de error a info, cada una con título,
+  detalle y remediation si existe. Es la parte que más se lee: dale
+  jerarquía visual fuerte.
+- sections en acordeones o tarjetas apiladas, cada kind con su
+  representación correcta.
+- logs en un panel plegable ("detalles técnicos"), monoespaciado, con
+  niveles.
+- Descargas: usa GET /api/formats para construir los botones (txt, md, html,
+  json, pdf). Descarga por GET /api/run/:id/:formato de forma nativa
+  (ancla), no con fetch+blob, salvo que verifiques que funciona con las
+  cookies de sesión.
+
+
+SISTEMA VISUAL
+--------------
+
+- Dirección: consola de diagnóstico profesional, no una landing page ni un
+  dashboard de iconos decorativos. Densidad media, mucho dato, mucho escaneo.
+- Paleta sobria y un solo acento. Semánticos consistentes en todo: ok verde,
+  warn ámbar, bad rojo, neutral gris. El mismo significado en badges,
+  tablas, medidores y bordes.
+- Tipografía: sans del sistema para la UI; monoespaciada para IPs, dominios,
+  banners de SMTP, JSON y logs. tabular-nums en todas las columnas
+  numéricas.
+- Modo claro y oscuro funcionales, con tokens CSS; respeta
+  prefers-color-scheme y permite override manual persistido.
+- Tablas: sticky header, zebra sutil, celdas con tone como fondo tenue,
+  truncate con tooltip para valores largos, y botón de copiar en IPs y
+  dominios.
+- meter: barra con el porcentaje dentro y el tone correcto; se usa para
+  puntuaciones.
+- Microanimaciones solo donde aporten (aparición de resultados, cambio de
+  estado).
+- Accesibilidad: foco visible, navegación completa por teclado, contraste
+  AA, aria-live para el resultado de la ejecución, labels asociados a cada
+  campo.
+- Responsive: el sidebar colapsa a drawer en móvil; el informe pasa a una
+  columna.
+
+
+SEGURIDAD (NO NEGOCIABLE)
+------------------------
+
+- Campos type: 'password' con autoComplete="off" y spellCheck={false}.
+- Nunca escribas contraseñas en localStorage, sessionStorage, URL, logs de
+  consola ni estado global persistente. Solo en el estado del formulario
+  mientras dura.
+- Los params que llegan del historial ya vienen con la contraseña
+  enmascarada ("[REDACTADO]"): muéstralo como está, sin intentar
+  reconstruirlo.
+- GET /api/config expone perfilesCorreo con hosts y flags, nunca con valores
+  de contraseña. Puedes mostrar host y puerto de un perfil como sugerencia,
+  pero jamás sus credenciales.
+- No renderices con innerHTML sin escapar: el contenido viene de servidores
+  externos (banners SMTP, cabeceras DNS). Usa el escapado de React o
+  textContent.
+- Pon CSP y X-Content-Type-Options: nosniff desde la configuración del
+  servidor de Vite, para desarrollo.
+
+
+FUERA DE ALCANCE
+----------------
+
+- No modifiques ni reescribas el backend, ni sus contratos.
+- No añadas autenticación, base de datos, ni servicios externos.
+- No uses localStorage para historiales: el historial vive en el servidor.
+- No inventes datos de ejemplo para rellenar pantallas: si la API falla, se
+  dice.
+
+
+CRITERIO DE ACEPTACIÓN
+----------------------
+
+Cuando termines, la app debe permitir, en menos de tres clics:
+elegir smtp-validator -> escribir host y puerto -> ejecutar -> leer el
+veredicto y los hallazgos -> volver a una ejecución anterior del historial.
