@@ -197,9 +197,12 @@ function parsearFirma(valor) {
     if (clave) tag[clave] = parte.slice(corte + 1).trim();
   }
   return {
+    valor: String(valor),
+    etiquetas: tag,
     dominio: tag.d ? tag.d.toLowerCase() : null,
     selector: tag.s || null,
     algoritmo: tag.a || null,
+    canonizacion: tag.c || null,
     encabezados: tag.h ? tag.h.split(':').map((h) => h.trim()) : [],
     cuerpoHash: tag.bh || null
   };
@@ -303,12 +306,27 @@ function separarParte(parte) {
   return { cabeceras, cuerpo: texto.slice(corte + 2) };
 }
 
-/** Decodifica quoted-printable, que es lo que usan casi todos los cuerpos. */
+/** Decodifica quoted-printable y base64. */
 function decodificar(texto, encoding) {
-  if (String(encoding).toLowerCase() !== 'quoted-printable') return String(texto);
-  return String(texto)
-    .replace(/=\n/g, '')
-    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+  const enc = String(encoding).toLowerCase();
+  if (enc === 'quoted-printable') {
+    return String(texto)
+      .replace(/=\n/g, '')
+      .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+  }
+  if (enc === 'base64') {
+    const limpio = String(texto).replace(/\s+/g, '');
+    // Validar que es base64 correcto antes de decodificar: solo chars válidos y padding correcto
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(limpio) || limpio.length % 4 !== 0) {
+      return String(texto);
+    }
+    try {
+      return Buffer.from(limpio, 'base64').toString('utf8');
+    } catch {
+      return String(texto);
+    }
+  }
+  return String(texto);
 }
 
 module.exports = { parsear, parsearCabeceras, parsearAuthResults, ipDeRecibidas, dominioDe, esPrivada };

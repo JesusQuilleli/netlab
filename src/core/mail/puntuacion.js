@@ -13,7 +13,7 @@
 'use strict';
 
 /** Fracción de los puntos que aporta cada estado. */
-const FACTOR = { ok: 1, warn: 0.5, error: 0 };
+const FACTOR = { ok: 1, warn: 0.5, error: 0, 'no-evaluable': 0 };
 
 /** Nota a partir de la cual el resultado se considera bueno o mejorable. */
 const UMBRAL_OK = 9;
@@ -54,8 +54,9 @@ function check(datos) {
  */
 function evaluar(checks) {
   const lista = (checks || []).filter(Boolean);
-  const max = lista.reduce((s, c) => s + c.peso, 0);
-  const obtenidos = lista.reduce((s, c) => s + c.peso * FACTOR[c.estado], 0);
+  const evaluables = lista.filter((c) => c.estado !== 'no-evaluable');
+  const max = evaluables.reduce((s, c) => s + c.peso, 0);
+  const obtenidos = evaluables.reduce((s, c) => s + c.peso * FACTOR[c.estado], 0);
   const nota = max > 0 ? redondear((obtenidos / max) * 10, 1) : 0;
 
   return {
@@ -64,7 +65,7 @@ function evaluar(checks) {
     obtenidos: redondear(obtenidos, 2),
     nota,
     tone: nota >= UMBRAL_OK ? TONOS.OK : nota >= UMBRAL_WARN ? TONOS.WARN : TONOS.BAD,
-    fallos: lista.filter((c) => c.estado !== 'ok')
+    fallos: lista.filter((c) => c.estado !== 'ok' && c.estado !== 'no-evaluable')
   };
 }
 

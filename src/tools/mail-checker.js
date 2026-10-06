@@ -5,10 +5,13 @@
  * DOS MODOS, UNA HERRAMIENTA
  *   1. Dominio: consulta MX, SPF, DKIM, DMARC, PTR, listas negras y las
  *      extensiones de transporte (MTA-STS, TLS-RPT, BIMI) por DNS.
- *   2. Mensaje: analiza la fuente (.eml) de un correo ya enviado: qué dijeron
- *      los receptores de SPF/DKIM/DMARC, la reputación de la IP emisora y el
- *      contenido. No verifica la firma DKIM en criptográfico ni descarga
- *      enlaces: se apoya en `Authentication-Results`, y el informe lo dice.
+ *   2. Mensaje: analiza la fuente (.eml) de un correo ya enviado. Evalúa SPF
+ *      contra la IP real, verifica la firma DKIM en criptográfico y comprueba
+ *      la alineación de DMARC con `core/mail/verificar`; cuando no se puede
+ *      (sin IP, sin clave publicada, firma sin "b="), se apoya en lo que dejó
+ *      escrito el receptor en `Authentication-Results` y el informe dice de
+ *      dónde sale cada veredicto. También mira la reputación de la IP emisora,
+ *      la coherencia HELO/PTR y el contenido.
  *
  * La puntuación es sobre 10 y cada comprobación aporta puntos, igual que
  * mail-tester. El estado global (pass/warn/fail) sale de los hallazgos.
@@ -42,6 +45,7 @@ const transporteMod = require('../core/mail/transporte');
 const mensajeMod = require('../core/mail/mensaje');
 const contenidoMod = require('../core/mail/contenido');
 const puntuacion = require('../core/mail/puntuacion');
+const verificarMod = require('../core/mail/verificar');
 
 const ID = 'mail-checker';
 
@@ -292,6 +296,7 @@ async function modoDominio(result, params, entorno) {
   const spf = spfMod.parsear(registrosTxtDe(txtDominio));
   const dkim = evaluarSelectores(respuestas, selectores, dominio);
   const dmarc = dmarcMod.parsear(registrosTxtDe(r('dmarc')));
+  const spfListas = await consultarIpSpf(blacklists, spf, { conListas, timeout });
   const transporte = extensiones
     ? transporteMod.parsear({ mtaSts: registrosTxtDe(r('mtaSts')), tlsRpt: registrosTxtDe(r('tlsRpt')), bimi: registrosTxtDe(r('bimi')) })
     : null;
@@ -304,7 +309,7 @@ async function modoDominio(result, params, entorno) {
     checkDkim(dkim, dominio),
     checkDmarc(dmarc),
     checkPtr(servidores),
-    checkListas(servidores, conListas),
+    checkListas(servidores, conListas, spfListas),
     ...(extensiones ? [checkMtaSts(transporte.mtaSts), checkTlsRpt(transporte.tlsRpt), checkBimi(transporte.bimi)] : [])
   ];
 
@@ -321,6 +326,7 @@ async function modoDominio(result, params, entorno) {
     seccionesExtra: (result_) => {
       seccionMx(result_, servidores, conListas);
       seccionSpf(result_, spf);
+      seccionSpfIp(result_, spfListas);
       seccionDkim(result_, dkim, dominio);
       seccionDmarc(result_, dmarc);
       if (transporte) seccionTransporte(result_, transporte);
@@ -373,12 +379,28 @@ async function resolverServidores(dns, mx, registrosA, registrosAAAA, timeout) {
     const direcciones = [...ipsDe(respuestas.get(`A:${host.exchange}`)), ...ipsDe(respuestas.get(`AAAA:${host.exchange}`))];
     const ptr = [];
     for (const ip of direcciones.slice(0, 3)) {
-      const nombres = await dns.resolverPTR(ip);
-      ptr.push({ ip, nombres: nombres || [] });
+      const nombres = (await dns.resolverPTR(ip)) || [];
+      ptr.push({ ip, nombres, coherente: await verificarFcrdns(dns, ip, nombres, timeout) });
     }
     servidores.push({ host: host.exchange, prioridad: host.priority, direcciones, ptr, implicito: false });
   }
   return servidores;
+}
+
+/**
+ * Comprueba el FCrDNS de una inversa: el nombre que devuelve el PTR debe
+ * resolver otra vez a la misma IP. Devuelve true/false, o null si no hay PTR.
+ */
+async function verificarFcrdns(dns, ip, nombres, timeout) {
+  const nombresPrueba = (nombres || []).slice(0, 2);
+  if (!nombresPrueba.length) return null;
+  for (const nombre of nombresPrueba) {
+    const a = await dns.consultar(nombre, 'A', { timeout, reintentos: 1 });
+    if (ipsDe(a).some((v) => v === ip)) return true;
+    const aaaa = await dns.consultar(nombre, 'AAAA', { timeout, reintentos: 1 });
+    if (ipsDe(aaaa).some((v) => v === ip)) return true;
+  }
+  return false;
 }
 
 /** Consulta listas negras para las IPs de los servidores. */
@@ -397,6 +419,32 @@ async function marcarListasNegras(blacklists, servidores, { conListas, timeout }
   }
 }
 
+/**
+ * Consulta listas negras para las IPs que el SPF declara como autorizadas.
+ * Si una de ellas está en una lista, un receptor puede marcar el correo del
+ * dominio como spam aunque la configuracion de registros sea impecable.
+ */
+async function consultarIpSpf(blacklists, spf, { conListas, timeout }) {
+  if (!conListas || !spf?.presente) return [];
+  const ips = [];
+  for (const m of spf.mecanismos || []) {
+    if ((m.nombre === 'ip4' || m.nombre === 'ip6') && m.valor) {
+      const base = m.valor.split('/')[0];
+      if (!ips.includes(base)) ips.push(base);
+    }
+  }
+  const salida = [];
+  for (const ip of ips) {
+    try {
+      const { resultados, resumen } = await blacklists.consultar(ip, { timeout, concurrencia: 4 });
+      salida.push({ ip, origen: 'SPF', resultados, resumen });
+    } catch (error) {
+      salida.push({ ip, origen: 'SPF', resultados: [], resumen: { listadas: 0, sinDatos: 1 }, error: error.message });
+    }
+  }
+  return salida;
+}
+
 /* ------------------------------------------------------------------ *
  * Modo mensaje
  * ------------------------------------------------------------------ */
@@ -408,7 +456,10 @@ async function modoMensaje(result, mensaje, entorno) {
   result.target = dominio || mensaje.ipEmisor || 'correo enviado';
   log?.info?.(`Analizando un correo de ${mensaje.from || 'remitente desconocido'}`);
 
-  // --- DNS del dominio remitente y del IP emisor ---------------------------
+  const helo = heloDe(mensaje);
+  const conListas = result.params.listasNegras !== false;
+
+  // --- DNS del dominio remitente ------------------------------------------
   const consultas = [];
   if (dominio) {
     consultas.push({ clave: 'txt', nombre: dominio, tipo: 'TXT' });
@@ -417,14 +468,19 @@ async function modoMensaje(result, mensaje, entorno) {
   const respuestas = indexar(consultas.length ? await consultarMuchas(dns, consultas, timeout) : []);
   const r = (clave) => respuestas.get(clave) || { ok: false, valores: [] };
 
-  const spfDominio = spfMod.parsear(registrosTxtDe(r('txt')));
-  const dmarcDominio = dmarcMod.parsear(registrosTxtDe(r('dmarc')));
+  const txtSpf = registrosTxtDe(r('txt'));
+  const txtDmarc = registrosTxtDe(r('dmarc'));
+  const spfDominio = spfMod.parsear(txtSpf);
+  const dmarcDominio = dmarcMod.parsear(txtDmarc);
+
+  // --- Verificación propia: SPF, DKIM y DMARC ------------------------------
+  const verificacion = await verificarMensaje(mensaje, { dns, timeout, dominio, helo, txtSpf, txtDmarc });
 
   let ptr = [];
   if (mensaje.ipEmisor) ptr = (await dns.resolverPTR(mensaje.ipEmisor)) || [];
 
   let listas = null;
-  if (mensaje.ipEmisor && result.params.listasNegras !== false) {
+  if (mensaje.ipEmisor && conListas) {
     try {
       listas = await blacklists.consultar(mensaje.ipEmisor, { timeout, concurrencia: 4 });
     } catch (error) {
@@ -435,11 +491,11 @@ async function modoMensaje(result, mensaje, entorno) {
   const contenido = contenidoMod.evaluar(mensaje);
 
   const checks = [
-    checkSpfMensaje(mensaje, spfDominio, dominio),
-    checkDkimMensaje(mensaje, dominio),
-    checkDmarcMensaje(mensaje, dmarcDominio, dominio),
-    checkPtrMensaje(mensaje, ptr),
-    checkListasMensaje(listas),
+    checkSpfMensaje(mensaje, spfDominio, dominio, verificacion.spf),
+    checkDkimMensaje(mensaje, dominio, verificacion.dkim),
+    checkDmarcMensaje(mensaje, dmarcDominio, dominio, verificacion.dmarc),
+    checkPtrMensaje(mensaje, ptr, helo),
+    ...(conListas ? [checkListasMensaje(listas)] : []),
     checkFormato(mensaje),
     checkUnsubscribe(mensaje),
     ...contenido.checks
@@ -456,16 +512,47 @@ async function modoMensaje(result, mensaje, entorno) {
       ['Message-ID', 'cabecera', mensaje.messageId || '—', mensaje.messageId ? 'ok' : 'warn'],
       ['Date', 'cabecera', mensaje.fecha || '—', mensaje.fecha ? 'ok' : 'warn'],
       ['IP emisora', 'red', mensaje.ipEmisor || '—', mensaje.ipEmisor ? 'ok' : 'warn'],
+      ['HELO', 'red', helo || '—', helo ? 'ok' : 'neutral'],
       ['PTR', 'DNS', ptr.length ? ptr.join(', ') : '—', ptr.length ? 'ok' : 'warn']
     ]),
     seccionesExtra: (result_) => {
       seccionCabeceras(result_, mensaje);
-      seccionAutenticacion(result_, mensaje, spfDominio, dmarcDominio, dominio);
+      seccionAutenticacion(result_, mensaje, spfDominio, dmarcDominio, dominio, verificacion);
+      seccionVerificacion(result_, verificacion, dominio);
       seccionContenido(result_, contenido);
-      if (mensaje.ipEmisor) seccionIp(result_, mensaje, ptr, listas);
+      if (mensaje.ipEmisor) seccionIp(result_, mensaje, ptr, listas, helo);
       if (dominio) seccionDmarc(result_, dmarcDominio);
     }
   });
+}
+
+/**
+ * Evalúa SPF, DKIM y DMARC con `core/mail/verificar` y devuelve los veredictos.
+ *
+ * Si no hay remitente que comprobar (el mensaje no trae ni From ni Return-Path)
+ * no se consulta nada: el informe lo dice con un "no-evaluable" en lugar de
+ * inventar un fallo. Los TXT ya consultados por el modo mensaje se reutilizan
+ * para no repetir la consulta.
+ */
+async function verificarMensaje(mensaje, { dns, timeout, dominio, helo, txtSpf, txtDmarc }) {
+  const salida = { spf: null, dkim: [], dmarc: null };
+  if (!dominio) return salida;
+
+  const opciones = { timeout, dnsModulo: dns };
+
+  if (mensaje.ipEmisor) {
+    salida.spf = await verificarMod.verificarSpf(dominio, mensaje.ipEmisor, helo, { ...opciones, txt: txtSpf });
+  }
+
+  for (const firma of (mensaje.dkimFirmas || []).slice(0, 3)) {
+    if (!firma.selector || !firma.dominio) continue;
+    salida.dkim.push(await verificarMod.verificarDkim(mensaje, firma.selector, firma.dominio, opciones));
+  }
+
+  const mejorDkim = salida.dkim.find((d) => d.ok) || salida.dkim.find((d) => d.estado === 'error') || salida.dkim[0] || null;
+  salida.dmarc = await verificarMod.verificarDmarc(mensaje, salida.spf, mejorDkim, dominio, { ...opciones, txt: txtDmarc });
+
+  return salida;
 }
 
 /* ------------------------------------------------------------------ *
@@ -615,21 +702,27 @@ function checkPtr(servidores) {
   // que un dominio que solo emite correo (o que publica un null MX) salga mal.
   if (!conIp.length) return null;
   const sinPtr = conIp.filter((s) => !s.ptr.some((p) => p.nombres.length));
-  const estado = sinPtr.length ? 'warn' : 'ok';
+  const incoherente = conIp.flatMap((s) => (s.ptr || []).filter((p) => p.nombres.length && p.coherente === false));
+  const estado = sinPtr.length || incoherente.length ? 'warn' : 'ok';
+  const detalleIncoherente = incoherente.length
+    ? ` FCrDNS: ${incoherente.map((p) => `${p.ip} → ${p.nombres.join(', ')}, pero ese nombre no resuelve a la IP`).join('; ')}.`
+    : '';
   return puntuacion.check({
     id: 'ptr', categoria: 'PTR', titulo: 'Resolución inversa (PTR) de los MX', peso: PESOS_DOMINIO.ptr, estado,
     detalle: sinPtr.length
-      ? `Sin PTR: ${sinPtr.map((s) => s.host).join(', ')}. Un servidor de correo sin PTR pierde entregabilidad.`
-      : `Todos los MX (${conIp.length}) tienen PTR.`,
-    recomendacion: sinPtr.length ? 'Configura el PTR de la IP para que apunte al nombre del servidor.' : null
+      ? `Sin PTR: ${sinPtr.map((s) => s.host).join(', ')}. Un servidor de correo sin PTR pierde entregabilidad.${detalleIncoherente}`
+      : incoherente.length
+        ? detalleIncoherente.trim()
+        : `Todos los MX (${conIp.length}) tienen PTR y resuelve de vuelta a la misma IP (FCrDNS).`,
+    recomendacion: sinPtr.length ? 'Configura el PTR de la IP para que apunte al nombre del servidor.' : incoherente.length ? 'Haz que el nombre del PTR resuelva a la IP del servidor (FCrDNS correcto).' : null
   });
 }
 
-function checkListas(servidores, conListas) {
+function checkListas(servidores, conListas, spfListas) {
   // Si el usuario la desactiva, no cuenta ni a favor ni en contra: sacarla del
   // máximo es lo honesto, porque no se ha comprobado nada.
   if (!conListas) return null;
-  const conListasDatos = servidores.flatMap((s) => s.listas || []);
+  const conListasDatos = [...servidores.flatMap((s) => s.listas || []), ...(spfListas || [])];
   if (!conListasDatos.length) {
     return puntuacion.check({ id: 'listas', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_DOMINIO.listas, estado: 'warn', detalle: 'No hay direcciones que consultar.', recomendacion: null });
   }
@@ -697,67 +790,227 @@ function checkBimi(b) {
  * Comprobaciones — mensaje
  * ------------------------------------------------------------------ */
 
-function checkSpfMensaje(mensaje, spfDominio, dominio) {
-  const spf = mensaje.spf;
-  const resultado = spf?.resultado || null;
-  const alineado = dominio && spfDominio.presente;
-  if (resultado === 'pass') {
-    return puntuacion.check({ id: 'spf-msg', categoria: 'SPF', titulo: 'SPF del remitente', peso: PESOS_MENSAJE.spf, estado: 'ok', detalle: `El receptor validó SPF (pass)${alineado ? ' y el dominio publica SPF' : ''}.`, recomendacion: null });
-  }
-  if (!resultado) {
-    return puntuacion.check({ id: 'spf-msg', categoria: 'SPF', titulo: 'SPF del remitente', peso: PESOS_MENSAJE.spf, estado: 'warn', detalle: 'El mensaje no trae el resultado de SPF en "Authentication-Results" ni "Received-SPF".', recomendacion: 'Asegúrate de enviar desde un servidor autorizado por el SPF del dominio.' });
-  }
-  if (['softfail', 'neutral', 'none'].includes(resultado)) {
-    return puntuacion.check({ id: 'spf-msg', categoria: 'SPF', titulo: 'SPF del remitente', peso: PESOS_MENSAJE.spf, estado: 'warn', detalle: `SPF = ${resultado}: el remitente no está claramente autorizado.`, recomendacion: 'Añade la IP del servidor emisor al SPF del dominio.' });
-  }
-  return puntuacion.check({ id: 'spf-msg', categoria: 'SPF', titulo: 'SPF del remitente', peso: PESOS_MENSAJE.spf, estado: 'error', detalle: `SPF = ${resultado}: el remitente no está autorizado.`, recomendacion: 'Revisa el SPF: probablemente no incluye este servidor de envío.' });
-}
+/** Frase común cuando el mensaje no trae remitente del que colgar una comprobación. */
+const SIN_REMITENTE =
+  'No hay remitente que comprobar: el mensaje no trae "From" ni "Return-Path". ¿El .eml está completo?';
 
-function checkDkimMensaje(mensaje, dominio) {
-  const firmas = mensaje.dkimFirmas;
-  const resultados = mensaje.dkim || [];
-  const pase = resultados.find((d) => d.resultado === 'pass');
-  if (pase) {
-    return puntuacion.check({ id: 'dkim-msg', categoria: 'DKIM', titulo: 'Firma DKIM', peso: PESOS_MENSAJE.dkim, estado: 'ok', detalle: `DKIM validado (d=${pase.dominio || dominio || '?'}).`, recomendacion: null });
-  }
-  if (resultados.some((d) => d.resultado === 'fail')) {
-    return puntuacion.check({ id: 'dkim-msg', categoria: 'DKIM', titulo: 'Firma DKIM', peso: PESOS_MENSAJE.dkim, estado: 'error', detalle: 'DKIM = fail: la firma no valida. La clave pública y la privada no cuadran.', recomendacion: 'Comprueba que el selector publicado corresponde a la clave con la que firmas.' });
-  }
-  if (!firmas.length) {
-    return puntuacion.check({ id: 'dkim-msg', categoria: 'DKIM', titulo: 'Firma DKIM', peso: PESOS_MENSAJE.dkim, estado: 'warn', detalle: 'El mensaje no lleva cabecera "DKIM-Signature".', recomendacion: 'Configura la firma DKIM en el servidor de envío.' });
-  }
-  return puntuacion.check({ id: 'dkim-msg', categoria: 'DKIM', titulo: 'Firma DKIM', peso: PESOS_MENSAJE.dkim, estado: 'warn', detalle: `Lleva ${firmas.length} firma(s) DKIM pero el receptor no reportó el resultado.`, recomendacion: 'Revisa que la clave pública del selector esté publicada.' });
-}
+function checkSpfMensaje(mensaje, spfDominio, dominio, verificacion) {
+  const base = { id: 'spf-msg', categoria: 'SPF', titulo: 'SPF del remitente', peso: PESOS_MENSAJE.spf };
 
-function checkDmarcMensaje(mensaje, dmarcDominio, dominio) {
-  const resultado = mensaje.dmarc?.resultado || null;
-  if (resultado === 'pass') {
-    return puntuacion.check({ id: 'dmarc-msg', categoria: 'DMARC', titulo: 'DMARC del remitente', peso: PESOS_MENSAJE.dmarc, estado: 'ok', detalle: 'DMARC validado (pass).', recomendacion: null });
+  if (!dominio) {
+    return puntuacion.check({
+      ...base,
+      estado: 'no-evaluable',
+      detalle: SIN_REMITENTE,
+      recomendacion: 'Pega el correo entero, empezando por las cabeceras (From, Received, Return-Path).'
+    });
   }
-  if (resultado && ['fail', 'reject', 'quarantine'].includes(resultado)) {
-    return puntuacion.check({ id: 'dmarc-msg', categoria: 'DMARC', titulo: 'DMARC del remitente', peso: PESOS_MENSAJE.dmarc, estado: 'error', detalle: `DMARC = ${resultado}.`, recomendacion: 'Asegura que SPF o DKIM alinean con el dominio del remitente.' });
-  }
-  if (!dmarcDominio.presente) {
-    return puntuacion.check({ id: 'dmarc-msg', categoria: 'DMARC', titulo: 'DMARC del remitente', peso: PESOS_MENSAJE.dmarc, estado: 'warn', detalle: `${dominio || 'El dominio del remitente'} no publica DMARC.`, recomendacion: 'Publica DMARC en "_dmarc" del dominio.' });
-  }
-  return puntuacion.check({ id: 'dmarc-msg', categoria: 'DMARC', titulo: 'DMARC del remitente', peso: PESOS_MENSAJE.dmarc, estado: 'warn', detalle: 'El mensaje no reporta un resultado DMARC.', recomendacion: 'Revisa la configuración de DMARC del dominio.' });
-}
 
-function checkPtrMensaje(mensaje, ptr) {
-  if (!mensaje.ipEmisor) {
-    return puntuacion.check({ id: 'ptr-msg', categoria: 'PTR', titulo: 'Resolución inversa (PTR)', peso: PESOS_MENSAJE.ptr, estado: 'warn', detalle: 'No se pudo extraer la IP emisora del mensaje.', recomendacion: 'Revisa que el .eml incluya las cabeceras "Received".' });
+  // 1) La evaluación propia del registro SPF contra la IP real, si concluyó.
+  if (verificacion?.estado === 'ok' || verificacion?.estado === 'error') {
+    return puntuacion.check({
+      ...base,
+      estado: verificacion.estado,
+      detalle: `${verificacion.detalle} Evaluado aquí sobre ${dominio} con la IP ${mensaje.ipEmisor}.`,
+      recomendacion: verificacion.estado === 'ok' ? null : 'Revisa el SPF: probablemente no incluye este servidor de envío.'
+    });
+  }
+
+  // 2) Lo que dejó escrito el receptor, que sigue mandando si aquí no concluimos.
+  const informe = mensaje.spf?.resultado || null;
+  const fuente = mensaje.spf?.fuente ? ` (${mensaje.spf.fuente})` : '';
+  if (informe === 'pass') {
+    return puntuacion.check({
+      ...base,
+      estado: 'ok',
+      detalle: `El receptor validó SPF: pass${fuente}.${verificacion ? ` Aquí no se pudo concluir: ${verificacion.detalle}` : ''}`,
+      recomendacion: null
+    });
+  }
+  if (informe === 'fail') {
+    return puntuacion.check({
+      ...base,
+      estado: 'error',
+      detalle: `SPF = fail${fuente}: el remitente no está autorizado.`,
+      recomendacion: 'Revisa el SPF: probablemente no incluye este servidor de envío.'
+    });
+  }
+  if (['softfail', 'neutral', 'none'].includes(informe)) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: `SPF = ${informe}${fuente}: el remitente no está claramente autorizado.`,
+      recomendacion: 'Añade la IP del servidor emisor al SPF del dominio.'
+    });
+  }
+
+  // 3) Sin ningún veredicto: que se note el motivo.
+  if (verificacion?.estado === 'warn') {
+    return puntuacion.check({ ...base, estado: 'warn', detalle: verificacion.detalle, recomendacion: 'Publica un SPF que autorice solo a tus servidores y termine en "-all".' });
+  }
+  if (spfDominio.presente) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: 'El dominio publica SPF, pero el mensaje no trae resultado del receptor y no hay IP con la que evaluarlo.',
+      recomendacion: 'Comprueba que la cabecera "Received" del .eml expone la IP pública del emisor.'
+    });
   }
   return puntuacion.check({
-    id: 'ptr-msg', categoria: 'PTR', titulo: 'Resolución inversa (PTR)', peso: PESOS_MENSAJE.ptr,
-    estado: ptr.length ? 'ok' : 'warn',
-    detalle: ptr.length ? `${mensaje.ipEmisor} → ${ptr.join(', ')}.` : `${mensaje.ipEmisor} no tiene PTR.`,
-    recomendacion: ptr.length ? null : 'Configura el PTR de la IP del servidor de envío.'
+    ...base,
+    estado: 'warn',
+    detalle: 'El mensaje no trae resultado de SPF y el dominio no publica registro SPF.',
+    recomendacion: 'Publica un TXT que empiece por "v=spf1" autorizando solo a tus servidores y terminando en "-all".'
   });
+}
+
+function checkDkimMensaje(mensaje, dominio, verificaciones) {
+  const base = { id: 'dkim-msg', categoria: 'DKIM', titulo: 'Firma DKIM', peso: PESOS_MENSAJE.dkim };
+  const propias = verificaciones || [];
+
+  if (!dominio) {
+    return puntuacion.check({
+      ...base,
+      estado: 'no-evaluable',
+      detalle: SIN_REMITENTE,
+      recomendacion: 'Pega el correo entero, empezando por las cabeceras (From, Received, DKIM-Signature).'
+    });
+  }
+
+  // 1) Verificación criptográfica propia: es la que manda cuando sale adelante.
+  const valida = propias.find((v) => v.estado === 'ok');
+  if (valida) return puntuacion.check({ ...base, estado: 'ok', detalle: valida.detalle, recomendacion: null });
+  const rota = propias.find((v) => v.estado === 'error');
+  if (rota) return puntuacion.check({ ...base, estado: 'error', detalle: rota.detalle, recomendacion: 'Comprueba que el selector publicado corresponde a la clave con la que firmas.' });
+
+  // 2) Lo que validó el receptor.
+  const pase = (mensaje.dkim || []).find((d) => d.resultado === 'pass');
+  if (pase) {
+    return puntuacion.check({
+      ...base,
+      estado: 'ok',
+      detalle: `El receptor validó la firma DKIM (pass, d=${pase.dominio || dominio}).${propias[0] ? ` Aquí no se pudo concluir: ${propias[0].detalle}` : ''}`,
+      recomendacion: null
+    });
+  }
+  if ((mensaje.dkim || []).some((d) => d.resultado === 'fail')) {
+    return puntuacion.check({
+      ...base,
+      estado: 'error',
+      detalle: 'DKIM = fail: la firma no valida. La clave pública y la privada no cuadran.',
+      recomendacion: 'Comprueba que el selector publicado corresponde a la clave con la que firmas.'
+    });
+  }
+
+  // 3) Sin veredicto de nadie.
+  if (!mensaje.dkimFirmas.length) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: 'El mensaje no lleva cabecera "DKIM-Signature".',
+      recomendacion: 'Configura la firma DKIM en el servidor de envío.'
+    });
+  }
+  if (propias[0]) {
+    return puntuacion.check({ ...base, estado: 'warn', detalle: propias[0].detalle, recomendacion: 'Revisa que la clave pública del selector esté publicada y que la firma incluya la etiqueta "b=".' });
+  }
+  return puntuacion.check({
+    ...base,
+    estado: 'warn',
+    detalle: `Lleva ${mensaje.dkimFirmas.length} firma(s) DKIM pero ni el receptor ni esta herramienta pudieron validarla.`,
+    recomendacion: 'Revisa que la clave pública del selector esté publicada.'
+  });
+}
+
+function checkDmarcMensaje(mensaje, dmarcDominio, dominio, verificacion) {
+  const base = { id: 'dmarc-msg', categoria: 'DMARC', titulo: 'DMARC del remitente', peso: PESOS_MENSAJE.dmarc };
+
+  if (!dominio) {
+    return puntuacion.check({
+      ...base,
+      estado: 'no-evaluable',
+      detalle: SIN_REMITENTE,
+      recomendacion: 'Pega el correo entero, empezando por las cabeceras (From, Return-Path).'
+    });
+  }
+
+  if (verificacion?.estado === 'ok') {
+    return puntuacion.check({ ...base, estado: 'ok', detalle: `${verificacion.detalle} Alineación comprobada aquí contra "_dmarc.${dominio}".`, recomendacion: null });
+  }
+  if (verificacion?.estado === 'error') {
+    return puntuacion.check({ ...base, estado: 'error', detalle: verificacion.detalle, recomendacion: 'Asegura que SPF o DKIM alinean con el dominio del remitente (header From).' });
+  }
+
+  const informe = mensaje.dmarc?.resultado || null;
+  if (informe === 'pass') {
+    return puntuacion.check({ ...base, estado: 'ok', detalle: `El receptor validó DMARC: pass${mensaje.dmarc?.dominio ? ` (header.from=${mensaje.dmarc.dominio})` : ''}.`, recomendacion: null });
+  }
+  if (informe && ['fail', 'reject', 'quarantine'].includes(informe)) {
+    return puntuacion.check({ ...base, estado: 'error', detalle: `DMARC = ${informe}.`, recomendacion: 'Asegura que SPF o DKIM alinean con el dominio del remitente.' });
+  }
+  if (!dmarcDominio.presente) {
+    return puntuacion.check({ ...base, estado: 'warn', detalle: `${dominio} no publica DMARC.`, recomendacion: 'Publica DMARC en "_dmarc" del dominio.' });
+  }
+  if (verificacion?.estado === 'warn') {
+    return puntuacion.check({ ...base, estado: 'warn', detalle: verificacion.detalle, recomendacion: 'Revisa la configuración de DMARC del dominio.' });
+  }
+  return puntuacion.check({ ...base, estado: 'warn', detalle: 'El mensaje no reporta un resultado DMARC y aquí no se pudo concluir la alineación.', recomendacion: 'Revisa la configuración de DMARC del dominio.' });
+}
+
+function checkPtrMensaje(mensaje, ptr, helo) {
+  const base = { id: 'ptr-msg', categoria: 'PTR', titulo: 'Resolución inversa (PTR)', peso: PESOS_MENSAJE.ptr };
+
+  if (!mensaje.ipEmisor) {
+    return puntuacion.check({
+      ...base,
+      estado: 'no-evaluable',
+      detalle: 'No se pudo extraer la IP emisora del mensaje: sin IP no hay reputación que comprobar.',
+      recomendacion: 'Revisa que el .eml incluya las cabeceras "Received".'
+    });
+  }
+  if (!ptr.length) {
+    const privada = mensajeMod.esPrivada(mensaje.ipEmisor);
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: privada
+        ? `${mensaje.ipEmisor} es una IP privada y no tiene PTR: la cabecera "Received" no expone la IP pública del emisor, así que la reputación no se puede mirar.`
+        : `${mensaje.ipEmisor} no tiene PTR.`,
+      recomendacion: privada
+        ? 'Exporta el correo desde el cliente con las cabeceras completas, o comprueba la IP pública del servidor de envío.'
+        : 'Configura el PTR de la IP del servidor de envío.'
+    });
+  }
+  const nombres = ptr.map((n) => n.toLowerCase().replace(/\.$/, ''));
+  const heloLimpio = helo ? helo.toLowerCase().replace(/\.$/, '') : null;
+  if (heloLimpio && !nombres.includes(heloLimpio)) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: `${mensaje.ipEmisor} → ${ptr.join(', ')}, pero el servidor se presentó como "${helo}" (HELO): la inversa y el HELO no coinciden.`,
+      recomendacion: 'El HELO/EHLO debe ser el mismo nombre que resuelve la IP del servidor de envío.'
+    });
+  }
+  return puntuacion.check({
+    ...base,
+    estado: 'ok',
+    detalle: `${mensaje.ipEmisor} → ${ptr.join(', ')}${helo ? `, coherente con el HELO (${helo})` : ''}.`,
+    recomendacion: null
+  });
+}
+
+/** HELO/EHLO del servidor que entregó el mensaje: el "from" de la primera Received. */
+function heloDe(mensaje) {
+  for (const recibida of mensaje.recibidas || []) {
+    const m = String(recibida).match(/^from\s+([^ \t(]+)/i);
+    if (m) return m[1].replace(/[.,;]$/, '');
+  }
+  return null;
 }
 
 function checkListasMensaje(listas) {
   if (!listas) {
-    return puntuacion.check({ id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas, estado: 'warn', detalle: 'No se pudo comprobar (sin IP emisora o desactivado).', recomendacion: null });
+    return puntuacion.check({ id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas, estado: 'no-evaluable', detalle: 'Sin IP emisora no hay reputación que comprobar.', recomendacion: null });
   }
   if (listas.resumen.listadas > 0) {
     return puntuacion.check({ id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas, estado: 'error', detalle: `La IP emisora está en: ${listas.resumen.zonasListadas.join(', ')}.`, recomendacion: 'Es la causa más grave de spam: pide la retirada y corrige el origen.' });
@@ -833,7 +1086,14 @@ function pintarInforme(result, datos) {
 
   addSummary(result, 'Puntuación', puntuacion.formatear(evaluado.nota), evaluado.tone);
   addSummary(result, 'Puntos', `${evaluado.obtenidos} de ${evaluado.max}`, evaluado.tone);
-  addSummary(result, 'Comprobaciones', `${evaluado.checks.length - evaluado.fallos.length} de ${evaluado.checks.length} correctas`, evaluado.fallos.length ? 'warn' : 'ok');
+  const evaluables = evaluado.checks.filter((c) => c.estado !== 'no-evaluable');
+  const sinComprobar = evaluado.checks.length - evaluables.length;
+  addSummary(
+    result,
+    'Comprobaciones',
+    `${evaluables.length - evaluado.fallos.length} de ${evaluables.length} correctas${sinComprobar ? `, ${sinComprobar} sin comprobar` : ''}`,
+    evaluado.fallos.length ? 'warn' : 'ok'
+  );
   addSummary(result, 'Modo', datos.modo);
   addSummary(result, datos.modo === 'Dominio' ? 'Dominio' : 'IP remitente', datos.objetivo);
 
@@ -858,8 +1118,8 @@ function pintarInforme(result, datos) {
       .map((c) => [
         c.titulo,
         c.categoria,
-        { valor: etiquetaEstado(c.estado), tone: c.estado === 'ok' ? 'ok' : c.estado === 'warn' ? 'warn' : 'bad' },
-        `${puntosDe(c)}/${c.peso}`,
+        { valor: etiquetaEstado(c.estado), tone: tonoDe(c.estado) },
+        c.estado === 'no-evaluable' ? '—' : `${puntosDe(c)}/${c.peso}`,
         c.detalle || '—'
       ])
   });
@@ -908,6 +1168,25 @@ function seccionMx(result, servidores, conListas) {
         { valor: sinResolver ? 'Falla' : s.implicito ? 'Implícito' : 'OK', tone: sinResolver ? 'bad' : s.implicito ? 'warn' : 'ok' }
       ];
     })
+  });
+}
+
+function seccionSpfIp(result, spfListas) {
+  if (!spfListas || !spfListas.length) return;
+  addSection(result, {
+    id: 'spf-ip',
+    title: 'IPs autorizadas por el SPF',
+    description: 'Las direcciones que el SPF declara como remitentes legítimos también se consultan en listas negras: aunque los registros sean perfectos, una IP autorizada listada sigue hundiendo el correo.',
+    kind: K.TABLA,
+    columns: ['IP', 'Origen', 'Listas negras'],
+    anchoColumnas: [20, 10, 70],
+    rows: spfListas.map((l) => [
+      l.ip,
+      l.origen,
+      l.resumen.listadas > 0
+        ? { valor: `listada en ${l.resumen.zonasListadas.join(', ')}`, tone: 'bad' }
+        : { valor: 'limpia', tone: 'ok' }
+    ])
   });
 }
 
@@ -1011,20 +1290,92 @@ function seccionCabeceras(result, mensaje) {
   });
 }
 
-function seccionAutenticacion(result, mensaje, spfDominio, dmarcDominio, dominio) {
+function seccionAutenticacion(result, mensaje, spfDominio, dmarcDominio, dominio, verificacion) {
+  const spfPropio = verificacion?.spf || null;
+  const dkimPropios = verificacion?.dkim || [];
+  const dmarcPropio = verificacion?.dmarc || null;
+
   const filas = [
-    ['SPF', mensaje.spf?.resultado || 'sin dato', mensaje.spf?.fuente || '—', spfDominio.presente ? 'dominio con SPF' : 'sin SPF en el dominio'],
-    ['DKIM', mensaje.dkim.length ? mensaje.dkim.map((d) => d.resultado).join(', ') : 'sin dato', mensaje.dkimFirmas.map((f) => f.selector || '—').join(', ') || 'sin firma', mensaje.dkimFirmas.map((f) => f.dominio || '—').join(', ') || '—'],
-    ['DMARC', mensaje.dmarc?.resultado || 'sin dato', mensaje.dmarc?.dominio || dominio || '—', dmarcDominio.presente ? 'dominio con DMARC' : 'sin DMARC en el dominio']
+    [
+      'SPF',
+      mensaje.spf?.resultado || 'sin dato',
+      etiquetaPropia(spfPropio),
+      `${mensaje.spf?.fuente || '—'} · ${spfDominio.presente ? 'dominio con SPF' : 'sin SPF en el dominio'}`
+    ],
+    [
+      'DKIM',
+      mensaje.dkim.length ? mensaje.dkim.map((d) => d.resultado).join(', ') : 'sin dato',
+      etiquetaPropia(dkimPropios),
+      `${mensaje.dkimFirmas.map((f) => f.selector || '—').join(', ') || 'sin firma'} · ${mensaje.dkimFirmas.map((f) => f.dominio || '—').join(', ') || '—'}`
+    ],
+    [
+      'DMARC',
+      mensaje.dmarc?.resultado || 'sin dato',
+      etiquetaPropia(dmarcPropio),
+      `${mensaje.dmarc?.dominio || dominio || '—'} · ${dmarcDominio.presente ? 'dominio con DMARC' : 'sin DMARC en el dominio'}`
+    ]
   ];
   addSection(result, {
     id: 'autenticacion',
     title: 'Resultado de autenticación',
-    description: 'Lo que dejó escrito el receptor en "Authentication-Results" / "Received-SPF".',
+    description: 'Dos fuentes: lo que dejó escrito el receptor ("Authentication-Results" / "Received-SPF") y lo que comprobó esta herramienta aquí mismo.',
     kind: K.TABLA,
-    columns: ['Método', 'Resultado', 'Dominio / selector', 'Contexto'],
-    anchoColumnas: [14, 20, 34, 32],
+    columns: ['Método', 'Informe del receptor', 'Verificado aquí', 'Contexto'],
+    anchoColumnas: [12, 20, 18, 44],
     rows: filas
+  });
+}
+
+/** Etiqueta corta del veredicto propio para la tabla de autenticación. */
+function etiquetaPropia(verificaciones) {
+  const lista = Array.isArray(verificaciones) ? verificaciones : [verificaciones];
+  const items = lista.filter(Boolean);
+  if (!items.length) return { valor: 'sin evaluar', tone: 'neutral' };
+  if (items.some((v) => v.estado === 'ok')) return { valor: 'pass', tone: 'ok' };
+  if (items.some((v) => v.estado === 'error')) return { valor: 'no valida', tone: 'bad' };
+  if (items.some((v) => v.estado === 'warn')) return { valor: 'advertencia', tone: 'warn' };
+  return { valor: 'sin comprobar', tone: 'neutral' };
+}
+
+/** La evidencia de la verificación propia, para que el informe se pueda auditar. */
+function seccionVerificacion(result, verificacion) {
+  if (!verificacion) return;
+  const items = [];
+
+  if (verificacion.spf) {
+    const v = verificacion.spf;
+    items.push(['SPF', v.detalle, tonoDe(v.estado)]);
+    const evaluacion = (v.evidencia?.pasos || []).find((p) => p.fase === 'evaluacion');
+    if (evaluacion?.razon) items.push(['SPF: por qué', `${evaluacion.mecanismo || 'all'} → ${evaluacion.razon}`]);
+    if (v.avisos?.length) items.push(['SPF: avisos', v.avisos.join(' ')]);
+  }
+
+  for (const v of verificacion.dkim || []) {
+    const clave = (v.evidencia?.pasos || []).find((p) => p.fase === 'clave');
+    items.push([
+      `DKIM (${v.evidencia?.selector || '?'} @ ${v.evidencia?.dominio || '?'})`,
+      `${v.detalle}${clave?.tipo ? ` · ${clave.tipo}` : ''}`,
+      tonoDe(v.estado)
+    ]);
+  }
+
+  const pasoDmarc = (verificacion.dmarc?.evidencia?.pasos || []).find((p) => p.fase === 'dmarc');
+  if (pasoDmarc) {
+    items.push([
+      'DMARC: alineación',
+      `SPF ${pasoDmarc.spfPass ? 'pass' : 'no pasa'}${pasoDmarc.spfAlineado ? ', alineado' : ', sin alinear'} · DKIM ${
+        pasoDmarc.dkimPass ? 'pass' : 'no pasa'
+      }${pasoDmarc.dkimAlineado ? ', alineado' : ', sin alinear'} · política p=${pasoDmarc.politica}`
+    ]);
+  }
+
+  if (!items.length) return;
+  addSection(result, {
+    id: 'verificacion',
+    title: 'Verificación propia',
+    description: 'Lo que comprobó esta herramienta por su cuenta (SPF evaluado contra la IP, firma DKIM y alineación DMARC), sin fiarse solo de lo que dice el receptor.',
+    kind: K.PARES,
+    items
   });
 }
 
@@ -1036,17 +1387,18 @@ function seccionContenido(result, contenido) {
     kind: K.TABLA,
     columns: ['Aspecto', 'Resultado', 'Detalle'],
     anchoColumnas: [28, 14, 58],
-    rows: contenido.checks.map((c) => [c.titulo, { valor: etiquetaEstado(c.estado), tone: c.estado === 'ok' ? 'ok' : c.estado === 'warn' ? 'warn' : 'bad' }, c.detalle || '—'])
+    rows: contenido.checks.map((c) => [c.titulo, { valor: etiquetaEstado(c.estado), tone: tonoDe(c.estado) }, c.detalle || '—'])
   });
 }
 
-function seccionIp(result, mensaje, ptr, listas) {
+function seccionIp(result, mensaje, ptr, listas, helo) {
   addSection(result, {
     id: 'ip',
     title: 'IP emisora',
     kind: K.PARES,
     items: [
       ['Dirección', mensaje.ipEmisor || '—'],
+      ['HELO del emisor', helo || 'sin HELO'],
       ['PTR', ptr.length ? ptr.join(', ') : 'sin PTR', ptr.length ? 'ok' : 'warn'],
       ['Listas negras', listas ? (listas.resumen.listadas > 0 ? `listada en ${listas.resumen.zonasListadas.join(', ')}` : 'limpia') : 'sin comprobar', listas && listas.resumen.listadas > 0 ? 'bad' : 'ok'],
       ['Saltos hasta el receptor', String(mensaje.recibidas.length)]
@@ -1093,10 +1445,15 @@ function tonoDe(estado) {
 }
 
 function etiquetaEstado(estado) {
-  return estado === 'ok' ? 'OK' : estado === 'warn' ? 'Revisar' : estado === 'error' ? 'Falla' : '—';
+  if (estado === 'ok') return 'OK';
+  if (estado === 'warn') return 'Revisar';
+  if (estado === 'error') return 'Falla';
+  if (estado === 'no-evaluable') return 'Sin comprobar';
+  return '—';
 }
 
 function puntosDe(c) {
+  if (c.estado === 'no-evaluable') return '—';
   const factor = c.estado === 'ok' ? 1 : c.estado === 'warn' ? 0.5 : 0;
   return Math.round(c.peso * factor * 100) / 100;
 }

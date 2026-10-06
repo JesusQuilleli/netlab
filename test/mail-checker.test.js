@@ -16,6 +16,8 @@ const crypto = require('node:crypto');
 
 const mail = require('../src/tools/mail-checker');
 const formats = require('../src/formats');
+const mensajes = require('../src/core/mail/mensaje');
+const verificar = require('../src/core/mail/verificar');
 const { SECCION_KINDS: K } = require('../src/core/result');
 
 /* ------------------------------------------------------------------ *
@@ -113,6 +115,70 @@ function entornoSano(extra = {}) {
     dns: dnsMail(zonaSana(), { ptr: { '93.184.216.34': ['mx1.ejemplo.com'], ...(extra.ptr || {}) } }),
     dnsbl: extra.dnsbl || dnsblFalso()
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Firma DKIM en tiempo de ejecución
+ * ------------------------------------------------------------------ */
+
+/** Par de claves propio, distinto del de la zona fija, para firmar en el test. */
+const CLAVE_DKIM_EFIMERA = (() => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  return {
+    privada: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    publica: publicKey.export({ type: 'spki', format: 'der' }).toString('base64')
+  };
+})();
+
+/** Un correo de ejemplo con todas las cabeceras que piden las comprobaciones. */
+function emlAutenticado() {
+  return [
+    'Received: from mail.ejemplo.com (mail.ejemplo.com [93.184.216.34])',
+    '\tby mx.destino.com with ESMTPS id 7GtY',
+    'From: Remitente <remitente@ejemplo.com>',
+    'To: Destino <destino@destino.com>',
+    'Date: Tue, 06 Oct 2026 09:00:00 +0200',
+    'Message-ID: <d0f1ab-42@ejemplo.com>',
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="utf-8"',
+    'Subject: Un asunto normal para probar',
+    'List-Unsubscribe: <mailto:salir@ejemplo.com>',
+    'List-Unsubscribe-Post: List-Unsubscribe=One-Click',
+    '',
+    'Hola, esto es una prueba de firma DKIM.',
+    '',
+    'Un cordial saludo.'
+  ].join('\r\n');
+}
+
+/**
+ * Añade a un .eml una DKIM-Signature real (rsa-sha256, c=relaxed/relaxed) con
+ * el selector "probe" de ejemplo.com. Usa la misma canonización que el motor
+ * de verificación, de modo que la prueba cubre el camino criptográfico entero.
+ */
+function firmarConDkim(emlSinFirma) {
+  const parseado = mensajes.parsear(emlSinFirma);
+  const cuerpoCanon = verificar.canonizarCuerpo(parseado.cuerpo, 'relaxed');
+  const bh = crypto.createHash('sha256').update(cuerpoCanon).digest('base64');
+  const cabeceras = [...Object.keys(parseado.cabeceras), 'dkim-signature'];
+  const valor = `v=1; a=rsa-sha256; c=relaxed/relaxed; d=ejemplo.com; s=probe; h=${cabeceras.join(':')}; bh=${bh}; b=`;
+  const conFirma = { ...parseado, cabeceras: { ...parseado.cabeceras, 'dkim-signature': [valor] } };
+  const canon = verificar.canonizarCabeceras(conFirma, cabeceras, 'relaxed');
+  const b = crypto.sign('sha256', canon, CLAVE_DKIM_EFIMERA.privada).toString('base64');
+  const [cabecerasBloque, ...cuerpo] = emlSinFirma.split(/\r?\n\r?\n/);
+  return `${cabecerasBloque}\nDKIM-Signature: ${valor}${b}\n\n${cuerpo.join('\n\n')}`;
+}
+
+/** DNS del dominio "probe" con el que se firmó el .eml. */
+function dnsDkimProbe(extra = {}) {
+  return dnsMail(
+    {
+      'ejemplo.com': { TXT: ok([['v=spf1 ip4:93.184.216.34 -all']]) },
+      'probe._domainkey.ejemplo.com': { TXT: ok([['v=DKIM1; k=rsa; p=' + CLAVE_DKIM_EFIMERA.publica]]) },
+      '_dmarc.ejemplo.com': { TXT: ok([['v=DMARC1; p=reject']]) }
+    },
+    { ptr: { '93.184.216.34': ['mail.ejemplo.com'], ...(extra.ptr || {}) } }
+  );
 }
 
 /* ------------------------------------------------------------------ *
@@ -320,7 +386,8 @@ test('desactivar las listas negras las saca del cálculo', async () => {
 test('un correo bien autenticado saca un 10', async () => {
   const dns = dnsMail(
     {
-      'ejemplo.com': { TXT: ok([['v=spf1 -all']]) },
+      'ejemplo.com': { TXT: ok([['v=spf1 ip4:93.184.216.34 -all']]) },
+      'default._domainkey.ejemplo.com': { TXT: ok([['v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnZAkfWk46ENB7WLZwtL1KtCARxsxYwJNlQO6VkXeIpMmVwV1QUZ7z6GDym8BvOq20xosGTC1q5ZFqjkTOrJ7Rvf/zDsjUYuPlUh3YGJwa+9eKgAeFgPZ94WUacUn+Wv+4SAXcfJbRN866PVqybtqvtuTyr5CfxWLYz3x4ss6aOHSbhDvEEzPwVYLUtgAc0B7Z5aQdrn+asXFOZsD1dQN2nrR730HeDHRpK3N/jYmV1TRlmANLCLIy16w51S8GDQiMkVgxB7HEJ3cGfGsukJUDGQ3gj3UVGe+wZ1dPIFO/t0LU/Z+sh6TBMZk7S/jEKUEV6/zkA2T0w8C6V07KFOLIwIDAQAB']]) },
       '_dmarc.ejemplo.com': { TXT: ok([['v=DMARC1; p=reject; rua=mailto:d@ejemplo.com']]) }
     },
     { ptr: { '93.184.216.34': ['mail.ejemplo.com'] } }
@@ -369,7 +436,11 @@ test('un correo sin autenticación se marca en cada método', async () => {
 
 test('el archivo .eml se acepta igual que el texto pegado', async () => {
   const dns = dnsMail(
-    { 'ejemplo.com': { TXT: ok([['v=spf1 -all']]) }, '_dmarc.ejemplo.com': { TXT: ok([['v=DMARC1; p=reject']]) } },
+    {
+      'ejemplo.com': { TXT: ok([['v=spf1 ip4:93.184.216.34 -all']]) },
+      'default._domainkey.ejemplo.com': { TXT: ok([['v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnZAkfWk46ENB7WLZwtL1KtCARxsxYwJNlQO6VkXeIpMmVwV1QUZ7z6GDym8BvOq20xosGTC1q5ZFqjkTOrJ7Rvf/zDsjUYuPlUh3YGJwa+9eKgAeFgPZ94WUacUn+Wv+4SAXcfJbRN866PVqybtqvtuTyr5CfxWLYz3x4ss6aOHSbhDvEEzPwVYLUtgAc0B7Z5aQdrn+asXFOZsD1dQN2nrR730HeDHRpK3N/jYmV1TRlmANLCLIy16w51S8GDQiMkVgxB7HEJ3cGfGsukJUDGQ3gj3UVGe+wZ1dPIFO/t0LU/Z+sh6TBMZk7S/jEKUEV6/zkA2T0w8C6V07KFOLIwIDAQAB']]) },
+      '_dmarc.ejemplo.com': { TXT: ok([['v=DMARC1; p=reject']]) }
+    },
     { ptr: { '93.184.216.34': ['mail.ejemplo.com'] } }
   );
   const r = await mail.ejecutar(
@@ -391,6 +462,114 @@ test('un texto que no es un correo se rechaza con un error claro', async () => {
   const r = await mail.ejecutar({ analizarMensaje: true, mensajePegado: 'solo una frase suelta' });
   assert.equal(r.status, 'error');
   assert.equal(r.error.code, 'PARAM_INVALIDO');
+});
+
+test('una firma DKIM real, creada aquí mismo, se valida', async () => {
+  const eml = firmarConDkim(emlAutenticado());
+  const r = await mail.ejecutar(
+    { analizarMensaje: true, mensajePegado: eml, listasNegras: true },
+    { dns: dnsDkimProbe(), dnsbl: dnsblFalso() }
+  );
+
+  assert.equal(r.status, 'pass', `hallazgos: ${r.findings.map((f) => f.title).join(' ; ')}`);
+  sinHallazgo(r, 'Firma DKIM');
+
+  const tabla = seccion(r, 'Comprobaciones');
+  const fila = tabla.rows.find((f) => f[0] === 'Firma DKIM');
+  assert.ok(fila, 'la tabla debe incluir la fila de la firma');
+  assert.equal(fila[2].valor, 'OK');
+
+  const propia = seccion(r, 'Verificación propia');
+  assert.ok(propia.items.some((f) => f[0].startsWith('DKIM') && /válida/.test(String(f[1]))), 'la evidencia propia debe decir que la firma vale');
+});
+
+test('un cuerpo alterado hace fallar la firma DKIM', async () => {
+  const eml = firmarConDkim(emlAutenticado()).replace('esto es una prueba', 'esto es OTRA prueba');
+  const r = await mail.ejecutar(
+    { analizarMensaje: true, mensajePegado: eml, listasNegras: true },
+    { dns: dnsDkimProbe(), dnsbl: dnsblFalso() }
+  );
+
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'Firma DKIM');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /modificad|bh|no valida|alterad/i);
+});
+
+test('un correo sin remitente no inventa fallos, se queda sin comprobar', async () => {
+  const sinRemitente = [
+    'Received: from mail.ejemplo.com (mail.ejemplo.com [93.184.216.34])',
+    '\tby mx.destino.com with ESMTPS id ab12',
+    'Date: Tue, 06 Oct 2026 10:00:00 +0200',
+    'Message-ID: <sin-remitente-1@mx.destino.com>',
+    'MIME-Version: 1.0',
+    'Subject: Sin remitente',
+    'List-Unsubscribe: <mailto:baja@destino.com>',
+    'List-Unsubscribe-Post: List-Unsubscribe=One-Click',
+    '',
+    'No hay From ni Return-Path.'
+  ].join('\r\n');
+  const dns = dnsMail({}, { ptr: { '93.184.216.34': ['mail.ejemplo.com'] } });
+  const r = await mail.ejecutar(
+    { analizarMensaje: true, mensajePegado: sinRemitente, listasNegras: true },
+    { dns, dnsbl: dnsblFalso() }
+  );
+
+  const tabla = seccion(r, 'Comprobaciones');
+  for (const titulo of ['SPF del remitente', 'Firma DKIM', 'DMARC del remitente']) {
+    const fila = tabla.rows.find((f) => f[0] === titulo);
+    assert.ok(fila, `falta la fila "${titulo}" en las comprobaciones`);
+    assert.equal(fila[2].valor, 'Sin comprobar');
+    assert.equal(fila[3], '—');
+  }
+  sinHallazgo(r, 'SPF del remitente');
+  sinHallazgo(r, 'Firma DKIM');
+  sinHallazgo(r, 'DMARC del remitente');
+  assert.match(valorResumen(r, 'Comprobaciones'), /sin comprobar/);
+});
+
+test('los vectores dorados de canonización DKIM no se mueven', () => {
+  assert.equal(verificar.canonizarCuerpo('A\r\n\tB  \r\n\r\n\r\nC\r\n\r\n', 'relaxed'), 'A\r\nB\r\n\r\n\r\nC\r\n');
+  assert.equal(verificar.canonizarCuerpo('A\r\n\tB  \r\nC', 'simple'), 'A\r\n\tB  \r\nC\r\n');
+  assert.equal(verificar.canonizarCuerpo('', 'relaxed'), '');
+  assert.equal(verificar.canonizarCuerpo('\r\n\r\n', 'relaxed'), '');
+
+  const mensaje = { cabeceras: { from: ['Joe  SixPack  <joe@football.example.com>'], subject: ['  lunch  '] } };
+  assert.equal(
+    verificar.canonizarCabeceras(mensaje, ['from', 'subject'], 'relaxed'),
+    'from:Joe SixPack <joe@football.example.com>\r\nsubject:lunch\r\n'
+  );
+
+  const conFirma = { cabeceras: { 'dkim-signature': ['v=1; a=rsa-sha256; d=x.com; s=k; bh=AAAA; b=XYZ=='] } };
+  assert.equal(verificar.canonizarCabeceras(conFirma, ['dkim-signature'], 'relaxed'), 'dkim-signature:v=1; a=rsa-sha256; d=x.com; s=k; bh=AAAA; b=\r\n');
+});
+
+test('un PTR que no resuelve de vuelta a la IP (FCrDNS) se avisa', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsMail(zonaSana(), { ptr: { '93.184.216.34': ['otro-nombre.ejemplo.com'] } }), dnsbl: dnsblFalso() }
+  );
+
+  const h = hallazgo(r, 'inversa');
+  assert.equal(h.severity, 'warn');
+  assert.match(h.detail, /FCrDNS/);
+});
+
+test('una IP autorizada por el SPF y listada es un fallo', async () => {
+  const zonas = zonaSana();
+  zonas['ejemplo.com'].TXT = ok([['v=spf1 ip4:198.51.100.7 -all']]);
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso({ listadas: ['198.51.100.7'] }) }
+  );
+
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'Listas negras');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /198\.51\.100\.7/);
+
+  const sec = seccion(r, 'IPs autorizadas por el SPF');
+  assert.ok(sec.rows.some((f) => f[0] === '198.51.100.7' && /^listada/.test(String(f[2]?.valor))));
 });
 
 /* ------------------------------------------------------------------ *

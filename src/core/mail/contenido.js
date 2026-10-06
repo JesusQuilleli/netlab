@@ -25,9 +25,9 @@ const PALABRAS_SPAM = [
   'make money',
   'work from home',
   'trabaja desde casa',
-  'oferta única',
+  'oferta unica',
   'limited time',
-  'haga clic aquí',
+  'haga clic aqui',
   'click here',
   'compre ahora',
   'buy now',
@@ -39,9 +39,9 @@ const PALABRAS_SPAM = [
   'guaranteed',
   'urgente',
   'urgent',
-  'actúe ahora',
+  'actue ahora',
   'act now',
-  'préstamo',
+  'prestamo',
   'viagra',
   'casino',
   'lottery',
@@ -94,6 +94,8 @@ function textoPlano(mensaje) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -122,6 +124,9 @@ function contenidoSinTexto(mensaje, texto, palabras) {
   }
   if (mensaje.html && !mensaje.texto) {
     return check('sin-alternativa-texto', 'HTML sin versión en texto', peso, 'warn', `El mensaje viaja solo en HTML. Incluye una parte "text/plain": es lo que esperan los filtros y los clientes que no muestran imágenes (${palabras} palabras en el HTML).`, 'Añade una parte text/plain con el mismo contenido (multipart/alternative).');
+  }
+  if (palabras === 0 && !mensaje.texto && !mensaje.html) {
+    return check('contenido-vacio', 'Contenido no parseado', peso, 'no-evaluable', 'No se pudo extraer texto del cuerpo: el mensaje puede estar vacío, en una codificación no soportada o el parseo MIME falló.', 'Verifica que el .eml incluye cuerpo y usa codificaciones estándar (base64, quoted-printable).');
   }
   return check('contenido-vacio', 'Contenido con texto alternativo', peso, 'ok', soloHtml ? 'Tiene HTML y texto.' : `${palabras} palabras en el cuerpo.`, null);
 }

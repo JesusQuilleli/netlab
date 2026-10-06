@@ -352,6 +352,13 @@ test('contenido: un cuerpo sin una sola palabra es un error', () => {
   assert.equal(check(r, 'contenido-vacio').estado, 'error');
 });
 
+test('contenido: sin texto ni html se marca como no-evaluable', () => {
+  const m = mensaje.parsear('From: a@ejemplo.com\nSubject: test\n\n');
+  const r = contenido.evaluar(m);
+  assert.equal(check(r, 'contenido-vacio').estado, 'no-evaluable');
+  assert.ok(check(r, 'contenido-vacio').detalle.includes('parseo'));
+});
+
 /* ------------------------------------------------------------------ *
  * Puntuación
  * ------------------------------------------------------------------ */
@@ -389,4 +396,48 @@ test('puntuación: un estado desconocido se trata como advertencia', () => {
 test('puntuación: formatea la nota con un decimal', () => {
   assert.equal(puntuacion.formatear(9), '9.0 / 10');
   assert.equal(puntuacion.formatear(8.55), '8.6 / 10');
+});
+
+test('puntuación: estado "no-evaluable" no cuenta en max ni en fallos', () => {
+  const r = puntuacion.evaluar([
+    puntuacion.check({ id: 'a', categoria: 'x', titulo: 'A', peso: 1, estado: 'ok' }),
+    puntuacion.check({ id: 'b', categoria: 'x', titulo: 'B', peso: 1, estado: 'no-evaluable' }),
+    puntuacion.check({ id: 'c', categoria: 'x', titulo: 'C', peso: 1, estado: 'error' })
+  ]);
+  assert.equal(r.max, 2, 'solo ok y error cuentan en max');
+  assert.equal(r.obtenidos, 1, 'solo ok suma puntos');
+  assert.equal(r.nota, 5.0, '1/2 * 10 = 5.0');
+  assert.equal(r.fallos.length, 1, 'no-evaluable no cuenta como fallo');
+});
+
+/* ------------------------------------------------------------------ *
+ * Mensaje: base64
+ * ------------------------------------------------------------------ */
+
+test('mensaje: el body base64 se decodifica', () => {
+  const base64 = Buffer.from('Hola mundo base64', 'utf8').toString('base64');
+  const eml = [
+    'From: a@ejemplo.com',
+    'Subject: test',
+    'Content-Type: text/plain; charset="utf-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    base64
+  ].join('\n');
+  const m = mensaje.parsear(eml);
+  assert.equal(m.texto, 'Hola mundo base64');
+});
+
+test('mensaje: base64 roto cae a texto plano sin romper', () => {
+  const eml = [
+    'From: a@ejemplo.com',
+    'Subject: test',
+    'Content-Type: text/plain; charset="utf-8"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    'esto no es base64 valido!!!'
+  ].join('\n');
+  const m = mensaje.parsear(eml);
+  // Al fallar la decodificación, devuelve el texto original
+  assert.ok(m.texto.includes('esto no es base64'));
 });
