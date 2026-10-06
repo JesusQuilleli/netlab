@@ -276,26 +276,34 @@ function canonizarCuerpo(cuerpo, metodo = 'simple') {
  */
 function canonizarCabeceras(mensaje, lista, metodo = 'simple') {
   const salida = [];
+  const canonSolaLinea = (clave, valor) => {
+    let linea = `${clave}:${valor}`;
+    if (clave === 'dkim-signature') {
+      // La propia DKIM-Signature se incluye sin su valor `b=` (RFC 6376 §3.7.2.2);
+      // el `;` que Exim deja tras el valor también se descarta al reconstruir.
+      linea = linea.replace(/\bb\s*=[^;]*;?/, 'b=');
+    }
+    if (metodo === 'relaxed') {
+      // RFC 6376 §3.4.2: sin espacio tras los dos puntos, secuencias de WSP
+      // colapsadas a un espacio y sin WSP final.
+      linea = linea.replace(/^([^:]+):[ \t]*/, '$1:');
+      linea = linea.replace(/[ \t]+/g, ' ').trim();
+    }
+    return linea;
+  };
   for (const nombre of lista) {
     const clave = String(nombre).trim().toLowerCase();
     const valores = mensaje.cabeceras?.[clave] || [];
     if (!valores.length) continue; // cabecera ausente: el signatario la trata como vacía
-    let valor = valores[valores.length - 1];
-
-    // La propia DKIM-Signature se incluye sin su valor `b=` (RFC 6376 §3.7.2.2).
-    if (clave === 'dkim-signature') {
-      valor = valor.replace(/\bb\s*=[^;]*/, 'b=');
-    }
-
-    if (metodo === 'relaxed') {
-      // RFC 6376 §3.4.2: sin espacio tras los dos puntos, secuencias de WSP
-      // colapsadas a un espacio y sin WSP final.
-      let linea = `${clave}:${valor}`.replace(/^([^:]+):[ \t]*/, '$1:');
-      linea = linea.replace(/[ \t]+/g, ' ').trim();
-      salida.push(linea);
-    } else {
-      salida.push(`${clave}:${valor}`.trim());
-    }
+    salida.push(canonSolaLinea(clave, valores[valores.length - 1]));
+  }
+  // RFC 6376 §3.7: al verificar, la propia DKIM-Signature se añade al final del
+  // hash aunque el signatario no la haya incluido en `h=` (Exim/OpenDKIM no la
+  // listan). Solo se añade si no figura ya entre las cabeceras firmadas.
+  const enLista = lista.map((n) => String(n).trim().toLowerCase()).includes('dkim-signature');
+  if (!enLista) {
+    const valores = mensaje.cabeceras?.['dkim-signature'] || [];
+    if (valores.length) salida.push(canonSolaLinea('dkim-signature', valores[valores.length - 1]));
   }
   return salida.join('\r\n') + (salida.length ? '\r\n' : '');
 }

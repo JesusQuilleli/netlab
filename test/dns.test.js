@@ -215,7 +215,36 @@ test('el error crudo del resolvedor sobrevive a los reintentos', async () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Contra la red real (opcionales)
+ * keyTag DNSSEC
+ * ------------------------------------------------------------------ */
+
+test('keyTagDeDnsKey reproduce el vector del RFC 4034 (60485)', () => {
+  // Clave de la sección 5.4 del RFC: " dskey.example.com. 86400 IN DNSKEY 256 3 5
+  // ( AQOeiiR0...ljwvFw== ); key id = 60485 ".
+  const base64 = 'AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMzNXxeYCmZDRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJBjEVv5f2wwjM9XzcnOf+EPbtG9DMBmADjFDc2w/rljwvFw==';
+  const clave = dns.keyTagDeDnsKey({ flags: 256, algorithm: 5, key: Buffer.from(base64, 'base64') });
+  assert.equal(clave, 60485);
+});
+
+test('keyTagDeDnsKey depende solo de la RDATA, no del nombre', () => {
+  const clave = Buffer.from('00 01 02 03 04'.replace(/ /g, ''), 'hex');
+  const uno = { flags: 256, algorithm: 13, key: clave };
+  // El RFC solo mezcla el nombre de dominio para el digest del DS; el keyTag
+  // se calcula sobre los octetos de la RDATA tal cual.
+  assert.equal(
+    dns.keyTagDeDnsKey(uno),
+    dns.keyTagDeDnsKey({ ...uno, flags: 256 }),
+    'el mismo rdata da el mismo tag'
+  );
+  assert.notEqual(
+    dns.keyTagDeDnsKey({ ...uno, flags: 257 }),
+    dns.keyTagDeDnsKey(uno),
+    'el bit SEP cambia el rdata y por tanto el tag'
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * Against the real network (opcionales)
  * ------------------------------------------------------------------ */
 
 test('una consulta real trae TTL y valores', { skip: false }, async (t) => {
@@ -249,4 +278,42 @@ test('solo A y AAAA traen TTL; el resto llega sin el', { skip: false }, async (t
     const r = await dns.consultar('ejemplo.com', tipo, { timeout: 5000, reintentos: 1 });
     assert.equal(r.ttl, null, `${tipo} no debe inventar un TTL`);
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * consultarDnssec (opcionales, contra la red real)
+ * ------------------------------------------------------------------ */
+
+test('consultarDnssec trae DNSKEY y DS coherentes de un dominio firmado', { skip: false }, async (t) => {
+  if (!(await haySalida())) return t.skip('sin salida a Internet');
+
+  const dk = await dns.consultarDnssec('cloudflare.com', 'DNSKEY', { timeout: 6000, reintentos: 1 });
+  assert.equal(dk.ok, true, dk.error);
+  assert.ok(dk.valores.length >= 2, 'una KSK y una ZSK como minimo');
+  assert.ok(dk.valores.some((v) => (v.flags & 0x0001) !== 0), 'debe haber una clave SEP/KSK');
+  assert.ok(dk.valores.some((v) => (v.flags & 0x0100) !== 0), 'debe haber una clave de zona');
+  dk.valores.forEach((v) => {
+    assert.equal(typeof v.keyTag, 'number', 'cada clave debe traer su keyTag');
+    assert.equal(typeof v.algorithm, 'number');
+  });
+
+  const ds = await dns.consultarDnssec('cloudflare.com', 'DS', { timeout: 6000, reintentos: 1 });
+  assert.equal(ds.ok, true, ds.error);
+  assert.ok(ds.valores.length > 0, 'cloudflare.com esta firmado y debe tener DS');
+
+  // Regla de oro: todo DS publicado tiene que apuntar a una clave que el
+  // dominio publique de verdad. Si no, la resolucion estaria rota.
+  const tagsPublicados = new Set(dk.valores.map((v) => v.keyTag));
+  assert.ok(
+    ds.valores.every((d) => tagsPublicados.has(d.keyTag)),
+    `las DS ${ds.valores.map((d) => d.keyTag).join(', ')} deben encajar con las DNSKEY ${[...tagsPublicados].join(', ')}`
+  );
+});
+
+test('consultarDnssec marca NXDOMAIN como ENOTFOUND', { skip: false }, async (t) => {
+  if (!(await haySalida())) return t.skip('sin salida a Internet');
+  const r = await dns.consultarDnssec('este-no-existe-jamas-abcxyz-987.com', 'DNSKEY', { timeout: 5000, reintentos: 0 });
+  assert.equal(r.ok, false);
+  assert.equal(r.codigoDns, 'ENOTFOUND');
+  assert.deepEqual(r.valores, []);
 });

@@ -63,7 +63,7 @@ const PESOS_DOMINIO = {
   bimi: 0.5
 };
 
-/** Pesos del modo mensaje. Suman 10. */
+/** Pesos del modo mensaje. Los principales suman 7.5; con el contenido, 9.5. */
 const PESOS_MENSAJE = {
   spf: 1.5,
   dkim: 1.5,
@@ -71,7 +71,7 @@ const PESOS_MENSAJE = {
   ptr: 1.0,
   listas: 2.0,
   formato: 0.5,
-  unsubscribe: 0.5
+  unsubscribe: 0
 };
 
 /** Campos del formulario, que consume la web. */
@@ -297,6 +297,7 @@ async function modoDominio(result, params, entorno) {
   const dkim = evaluarSelectores(respuestas, selectores, dominio);
   const dmarc = dmarcMod.parsear(registrosTxtDe(r('dmarc')));
   const spfListas = await consultarIpSpf(blacklists, spf, { conListas, timeout });
+  const dbl = await consultarDbl(blacklists, dominio, conListas, timeout);
   const transporte = extensiones
     ? transporteMod.parsear({ mtaSts: registrosTxtDe(r('mtaSts')), tlsRpt: registrosTxtDe(r('tlsRpt')), bimi: registrosTxtDe(r('bimi')) })
     : null;
@@ -309,7 +310,7 @@ async function modoDominio(result, params, entorno) {
     checkDkim(dkim, dominio),
     checkDmarc(dmarc),
     checkPtr(servidores),
-    checkListas(servidores, conListas, spfListas),
+    checkListas(servidores, conListas, spfListas, dbl),
     ...(extensiones ? [checkMtaSts(transporte.mtaSts), checkTlsRpt(transporte.tlsRpt), checkBimi(transporte.bimi)] : [])
   ];
 
@@ -321,7 +322,8 @@ async function modoDominio(result, params, entorno) {
       [`${dominio}`, 'MX', resumenMx(mx), mx.estado],
       [`${dominio}`, 'TXT (SPF)', spf.valor || '—', spf.presente ? 'ok' : 'warn'],
       [`_dmarc.${dominio}`, 'TXT (DMARC)', dmarc.valor || '—', dmarc.presente ? 'ok' : 'warn'],
-      ...filasDkim(result.sections, dkim.registros, dominio)
+      ...filasDkim(result.sections, dkim.registros, dominio),
+      ...filasDbl(dbl)
     ]),
     seccionesExtra: (result_) => {
       seccionMx(result_, servidores, conListas);
@@ -489,13 +491,14 @@ async function modoMensaje(result, mensaje, entorno) {
   }
 
   const contenido = contenidoMod.evaluar(mensaje);
+  const dbl = await consultarDbl(blacklists, dominio, conListas, timeout);
 
   const checks = [
     checkSpfMensaje(mensaje, spfDominio, dominio, verificacion.spf),
     checkDkimMensaje(mensaje, dominio, verificacion.dkim),
     checkDmarcMensaje(mensaje, dmarcDominio, dominio, verificacion.dmarc),
     checkPtrMensaje(mensaje, ptr, helo),
-    ...(conListas ? [checkListasMensaje(listas)] : []),
+    ...(conListas ? [checkListasMensaje(listas, dbl)] : []),
     checkFormato(mensaje),
     checkUnsubscribe(mensaje),
     ...contenido.checks
@@ -520,7 +523,7 @@ async function modoMensaje(result, mensaje, entorno) {
       seccionAutenticacion(result_, mensaje, spfDominio, dmarcDominio, dominio, verificacion);
       seccionVerificacion(result_, verificacion, dominio);
       seccionContenido(result_, contenido);
-      if (mensaje.ipEmisor) seccionIp(result_, mensaje, ptr, listas, helo);
+      if (mensaje.ipEmisor) seccionIp(result_, mensaje, ptr, listas, helo, dbl);
       if (dominio) seccionDmarc(result_, dmarcDominio);
     }
   });
@@ -718,12 +721,12 @@ function checkPtr(servidores) {
   });
 }
 
-function checkListas(servidores, conListas, spfListas) {
+function checkListas(servidores, conListas, spfListas, dbl) {
   // Si el usuario la desactiva, no cuenta ni a favor ni en contra: sacarla del
   // máximo es lo honesto, porque no se ha comprobado nada.
   if (!conListas) return null;
   const conListasDatos = [...servidores.flatMap((s) => s.listas || []), ...(spfListas || [])];
-  if (!conListasDatos.length) {
+  if (!conListasDatos.length && !dbl) {
     return puntuacion.check({ id: 'listas', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_DOMINIO.listas, estado: 'warn', detalle: 'No hay direcciones que consultar.', recomendacion: null });
   }
   const listadas = conListasDatos.filter((l) => l.resumen.listadas > 0);
@@ -732,6 +735,15 @@ function checkListas(servidores, conListas, spfListas) {
       id: 'listas', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_DOMINIO.listas, estado: 'error',
       detalle: `Listadas: ${listadas.map((l) => `${l.ip} en ${l.resumen.zonasListadas.join(', ')}`).join('; ')}.`,
       recomendacion: 'Pide la retirada en cada lista y corrige la causa (equipo comprometido, spam saliente...).'
+    });
+  }
+  // El dominio en la lista de dominios de Spamhaus (DBL) es un fallo aparte:
+  // las IP pueden estar limpias y que el dominio basto para marcar el correo.
+  if (dbl && dbl.estado === dnsbl.ESTADOS.LISTADA) {
+    return puntuacion.check({
+      id: 'listas', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_DOMINIO.listas, estado: 'error',
+      detalle: `El dominio ${dbl.dominio} aparece en la lista de dominios de Spamhaus (DBL): los receptores desconfian de su correo aunque las IP esten limpias.`,
+      recomendacion: 'Revisa que se envia desde ese dominio y pide la baja en DBL.'
     });
   }
   // Los "sin datos" por falta de registro en Spamhaus NO bajan la nota.
@@ -752,12 +764,18 @@ function checkListas(servidores, conListas, spfListas) {
     sinAcceso > 0
       ? ` Sin comprobar en ${sinAcceso} zonas de Spamhaus: no dan datos a resolvedores sin registrar.`
       : '';
+  const notaDbl =
+    dbl && dbl.estado === dnsbl.ESTADOS.LIMPIA
+      ? ` El dominio ${dbl.dominio} no aparece en Spamhaus DBL.`
+      : dbl && dbl.estado === dnsbl.ESTADOS.SIN_DATOS
+        ? ` Spamhaus DBL no respondio para ${dbl.dominio}: la reputacion del dominio no se pudo confirmar.`
+        : '';
 
   return puntuacion.check({
     id: 'listas', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_DOMINIO.listas, estado,
     detalle:
       `${conListasDatos.length} IP consultadas y ninguna listada` +
-      `${sinRespuesta || '.'}${sinPermiso}`,
+      `${sinRespuesta || '.'}${sinPermiso}${notaDbl}`,
     recomendacion: sinDatos ? 'Algunas listas no respondieron; el resultado no es concluyente.' : null
   });
 }
@@ -1008,7 +1026,14 @@ function heloDe(mensaje) {
   return null;
 }
 
-function checkListasMensaje(listas) {
+function checkListasMensaje(listas, dbl) {
+  if (dbl && dbl.estado === dnsbl.ESTADOS.LISTADA) {
+    return puntuacion.check({
+      id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas, estado: 'error',
+      detalle: `El dominio del remitente (${dbl.dominio}) está en Spamhaus DBL: la IP puede estar limpia y que el dominio baste para marcar el correo.`,
+      recomendacion: 'Revisa el historial del dominio y pide la baja en DBL.'
+    });
+  }
   if (!listas) {
     return puntuacion.check({ id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas, estado: 'no-evaluable', detalle: 'Sin IP emisora no hay reputación que comprobar.', recomendacion: null });
   }
@@ -1019,13 +1044,20 @@ function checkListasMensaje(listas) {
   // registro en Spamhaus se dice, pero no hace bajar la puntuacion del mensaje.
   const sinAcceso = listas.resumen.sinDatosSinAcceso || 0;
   const sinDatos = listas.resumen.sinDatos - sinAcceso;
+  const notaDbl =
+    dbl && dbl.estado === dnsbl.ESTADOS.LIMPIA
+      ? ` El dominio del remitente (${dbl.dominio}) no aparece en DBL.`
+      : dbl && dbl.estado === dnsbl.ESTADOS.SIN_DATOS
+        ? ` No se pudo confirmar DBL para ${dbl.dominio}: Spamhaus no respondió.`
+        : '';
   return puntuacion.check({
     id: 'listas-msg', categoria: 'Reputación', titulo: 'Listas negras', peso: PESOS_MENSAJE.listas,
     estado: sinDatos ? 'warn' : 'ok',
     detalle: sinDatos
-      ? `${sinDatos} listas sin respuesta.`
+      ? `${sinDatos} listas sin respuesta.${notaDbl}`
       : `La IP emisora no está en ninguna lista` +
-        (sinAcceso ? `. Sin comprobar en ${sinAcceso} zonas de Spamhaus: no dan datos a resolvedores sin registrar.` : '.'),
+        (sinAcceso ? `. Sin comprobar en ${sinAcceso} zonas de Spamhaus: no dan datos a resolvedores sin registrar.` : '.') +
+        notaDbl,
     recomendacion: null
   });
 }
@@ -1047,7 +1079,7 @@ function checkFormato(mensaje) {
 function checkUnsubscribe(mensaje) {
   const valor = mensaje.listUnsubscribe;
   if (!valor) {
-    return puntuacion.check({ id: 'unsubscribe', categoria: 'Formato', titulo: 'Cabecera List-Unsubscribe', peso: PESOS_MENSAJE.unsubscribe, estado: 'warn', detalle: 'No hay "List-Unsubscribe". En correo masivo es casi obligatorio y su ausencia penaliza.', recomendacion: 'Añade "List-Unsubscribe: <mailto:...>" y, mejor, "List-Unsubscribe-Post: List-Unsubscribe=One-Click".' });
+    return puntuacion.check({ id: 'unsubscribe', categoria: 'Formato', titulo: 'Cabecera List-Unsubscribe', peso: PESOS_MENSAJE.unsubscribe, estado: 'warn', detalle: 'No hay "List-Unsubscribe". Es un aviso (no resta puntos), pero el correo masivo debería llevarla.', recomendacion: 'Añade "List-Unsubscribe: <mailto:...>" y, mejor, "List-Unsubscribe-Post: List-Unsubscribe=One-Click".' });
   }
   const oneClick = mensaje.listUnsubscribePost && /one-click/i.test(mensaje.listUnsubscribePost);
   return puntuacion.check({
@@ -1391,7 +1423,7 @@ function seccionContenido(result, contenido) {
   });
 }
 
-function seccionIp(result, mensaje, ptr, listas, helo) {
+function seccionIp(result, mensaje, ptr, listas, helo, dbl) {
   addSection(result, {
     id: 'ip',
     title: 'IP emisora',
@@ -1401,6 +1433,9 @@ function seccionIp(result, mensaje, ptr, listas, helo) {
       ['HELO del emisor', helo || 'sin HELO'],
       ['PTR', ptr.length ? ptr.join(', ') : 'sin PTR', ptr.length ? 'ok' : 'warn'],
       ['Listas negras', listas ? (listas.resumen.listadas > 0 ? `listada en ${listas.resumen.zonasListadas.join(', ')}` : 'limpia') : 'sin comprobar', listas && listas.resumen.listadas > 0 ? 'bad' : 'ok'],
+      ...(dbl
+        ? [['Reputación del dominio (DBL)', textoDbl(dbl), tonoDbl(dbl)]]
+        : []),
       ['Saltos hasta el receptor', String(mensaje.recibidas.length)]
     ]
   });
@@ -1409,6 +1444,42 @@ function seccionIp(result, mensaje, ptr, listas, helo) {
 /* ------------------------------------------------------------------ *
  * Helpers de presentación
  * ------------------------------------------------------------------ */
+
+/**
+ * Consulta la reputación del dominio en Spamhaus DBL si el módulo de listas la
+ * soporta. Un doble de pruebas que solo implemente `consultar` no tiene DBL: se
+ * devuelve `null` y la comprobación no dice nada del dominio, igual que si la
+ * opción estuviera apagada.
+ */
+async function consultarDbl(blacklists, dominio, conListas, timeout) {
+  if (!conListas || !dominio || typeof blacklists.consultarDominio !== 'function') return null;
+  try {
+    return await blacklists.consultarDominio(dominio, { timeout });
+  } catch (error) {
+    return { estado: dnsbl.ESTADOS.SIN_DATOS, dominio, consultado: null, codigo: null, error: error.message, avisos: [] };
+  }
+}
+
+/** Texto legible del estado DBL de un dominio. */
+function textoDbl(dbl) {
+  if (!dbl) return 'sin comprobar';
+  if (dbl.estado === dnsbl.ESTADOS.LISTADA) return `listado en Spamhaus DBL (${dbl.dominio})`;
+  if (dbl.estado === dnsbl.ESTADOS.LIMPIA) return `no listado en Spamhaus DBL (${dbl.dominio})`;
+  return `sin respuesta de Spamhaus DBL (${dbl.dominio})`;
+}
+
+function tonoDbl(dbl) {
+  if (!dbl) return 'neutral';
+  if (dbl.estado === dnsbl.ESTADOS.LISTADA) return 'bad';
+  if (dbl.estado === dnsbl.ESTADOS.LIMPIA) return 'ok';
+  return 'warn';
+}
+
+/** Filas de "Registros y valores" para el estado DBL, cuando hay datos. */
+function filasDbl(dbl) {
+  if (!dbl) return [];
+  return [[`${dbl.dominio}`, 'DBL', textoDbl(dbl), tonoDbl(dbl)]];
+}
 
 function registrosTxtDe(registro) {
   if (!registro?.ok) return [];

@@ -52,17 +52,35 @@ function fallo(codigoDns, mensaje = 'fallo simulado') {
  * Módulo DNS falso.
  *
  * @param {object} porTipo Respuesta por tipo de registro.
- * @param {object} [extra] { dmarc, ptr }
+ * @param {object} [extra] { dmarc, ptr, dnssec }
+ *   `dnssec` es un mapa tipo → resultado que se sirve vía `consultarDnssec`.
+ *   Si no se dan, el método no existe y el chequeo DNSSEC se salta (como cuando
+ *   se inyecta un módulo que no lo soporta).
  */
 function dnsFalso(porTipo, extra = {}) {
   const dmarc = extra.dmarc ?? fallo('ENODATA', 'sin DMARC');
-  return {
+  const falso = {
     consultarLote: async (consultas) => consultas.map((c) => ({ ...c, ...(porTipo[c.tipo] ?? fallo('ENODATA', `sin ${c.tipo}`)) })),
     consultar: async (nombre, tipo) => {
       if (nombre.startsWith('_dmarc.')) return dmarc;
       return porTipo[tipo] ?? fallo('ENODATA', `sin ${tipo}`);
     },
     resolverPTR: async () => extra.ptr ?? []
+  };
+  if (extra.dnssec) {
+    falso.consultarDnssec = async (_nombre, tipo) => extra.dnssec[tipo] ?? fallo('ENODATA', `sin ${tipo}`);
+  }
+  return falso;
+}
+
+/** DNSKEY y DS que casan entre sí, para un dominio firmado sin problemas. */
+function dnssecSano() {
+  return {
+    DNSKEY: ok([
+      { flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 },
+      { flags: 256, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 34505 }
+    ]),
+    DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }])
   };
 }
 
@@ -375,6 +393,129 @@ test('un DMARC se puede consultar a mano y sale bien', async () => {
   );
   const fila = seccion(r, 'Registros').rows[0];
   assert.equal(fila[1], 'v=DMARC1; p=none; sp=quarantine', 'el TXT se lee entero, no cortado');
+});
+
+/* ------------------------------------------------------------------ *
+ * DNSSEC
+ * ------------------------------------------------------------------ */
+
+test('en el chequeo por defecto diagnostica un dominio firmado', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: dnssecSano() }) }
+  );
+
+  assert.equal(r.status, 'pass', `hallazgos: ${r.findings.map((f) => f.title).join(' ; ')}`);
+  assert.equal(hallazgo(r, 'Firmado con DNSSEC').severity, 'info');
+  sinHallazgo(r, 'DS no corresponde');
+  sinHallazgo(r, 'sin DS en la zona padre');
+
+  const secc = seccion(r, 'Estado DNSSEC');
+  assert.equal(secc.items.find(([k]) => k === 'Estado')[1], 'Firmado');
+  const claves = secc.items.find(([k]) => k === 'Claves DNSKEY')[1];
+  assert.match(claves, /KSK/, 'cuenta la KSK');
+  assert.match(claves, /keyTag 2371/, 'y dice el keyTag');
+  assert.equal(secc.items.find(([k]) => k === 'DS en la zona padre')[1], '1 DS (keyTag 2371)');
+  assert.equal(r.summary.find((s) => s.label === 'DNSSEC').value, 'Firmado');
+});
+
+test('un dominio sin firmar es información, no un aviso ni un fallo', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: { DNSKEY: ok([]), DS: ok([]) } }) }
+  );
+  assert.equal(r.status, 'pass');
+  assert.equal(hallazgo(r, 'Sin DNSSEC').severity, 'info');
+  assert.equal(seccion(r, 'Estado DNSSEC').items.find(([k]) => k === 'Estado')[1], 'Sin firmar');
+});
+
+test('un DS sin clave publicada detrás es un fallo de verdad', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dnssec: { DNSKEY: ok([]), DS: ok([{ keyTag: 999, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }]) } }) }
+  );
+  assert.equal(r.status, 'fail', 'una promesa de clave sin clave rompe la resolución');
+  assert.equal(hallazgo(r, 'no publica las claves').severity, 'error');
+});
+
+test('firmado pero sin DS en la zona padre avisa', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: { ...dnssecSano(), DS: ok([]) } }) }
+  );
+  assert.equal(r.status, 'warn');
+  assert.equal(hallazgo(r, 'sin DS en la zona padre').severity, 'warn');
+});
+
+test('un DS que no corresponde con ninguna DNSKEY es un fallo', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dnssec: { DNSKEY: ok([{ flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 }]), DS: ok([{ keyTag: 999, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }]) } }) }
+  );
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'no corresponde con ninguna clave');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /keyTag 999/, 'debe nombrar la DS problemática');
+  assert.match(h.detail, /keyTag 2371/, 'y la clave que sí está publicada');
+});
+
+test('acortar los tipos no dispara la consulta DNSSEC', async () => {
+  let llamadas = 0;
+  const espia = dnsFalso({ TXT: ok([['v=DMARC1; p=reject; rua=mailto:a@ejemplo.com']]) });
+  espia.consultarDnssec = async () => { llamadas++; return ok([]); };
+
+  const r = await dns.ejecutar({ dominio: '_dmarc.ejemplo.com', tipos: 'TXT' }, { dns: espia });
+
+  assert.equal(llamadas, 0, 'un tipo pedido a mano no debe arrastrar DNSKEY ni DS');
+  assert.ok(!r.sections.some((s) => s.title === 'Estado DNSSEC'), 'no debe existir la sección');
+  assert.equal(r.findings.length, 0);
+});
+
+test('DNSKEY y DS se pueden pedir a mano y la cadena se sigue revisando', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com', tipos: 'DNSKEY,DS' },
+    {
+      dns: dnsFalso(
+        {
+          ...baseSana(),
+          DNSKEY: ok([{ flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 }]),
+          DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }])
+        },
+        { dmarc: ok([['v=DMARC1; p=none']]) }
+      )
+    }
+  );
+
+  assert.equal(r.status, 'pass');
+  assert.equal(seccion(r, 'Registros').rows.length, 2, 'una fila por tipo pedido');
+  assert.equal(hallazgo(r, 'Firmado con DNSSEC').severity, 'info', 'se reutiliza lo pedido para el veredicto');
+});
+
+test('los registros DNSSEC se formatean en una línea legible', () => {
+  const { formatear, rolClave, nombrarAlgoritmo } = dns._internas;
+
+  assert.equal(rolClave(257), 'KSK');
+  assert.equal(rolClave(256), 'ZSK');
+  assert.equal(nombrarAlgoritmo(13), 'ECDSAP256SHA256');
+
+  assert.equal(
+    formatear({ flags: 257, algorithm: 13, keyTag: 2371, key: Buffer.from('00', 'hex') }),
+    'KSK · ECDSAP256SHA256 · keyTag 2371'
+  );
+  assert.equal(
+    formatear({ keyTag: 2371, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1), digestHex: '11'.repeat(32) }),
+    'keyTag 2371 · ECDSAP256SHA256 · SHA-256 · 1111111111111111…'
+  );
+  assert.equal(
+    formatear({ typeCovered: 'DNSKEY', algorithm: 13, keyTag: 2371, signersName: 'ejemplo.com', signature: Buffer.from('aa', 'hex'), expira: '2026-10-01' }),
+    'RRSIG DNSKEY · ECDSAP256SHA256 · keyTag 2371 · ejemplo.com · expira 2026-10-01'
+  );
+  assert.equal(formatear({ nextDomain: 'next.ejemplo.com', rrtypes: ['A', 'MX'] }), 'NSEC → next.ejemplo.com · A MX');
+  assert.equal(
+    formatear({ iterations: 5, saltHex: 'ab12', rrtypes: ['A'], nextDomain: Buffer.from('ff', 'hex') }),
+    'NSEC3 iter 5 · salt ab12 · A'
+  );
+  assert.equal(formatear({ flags: 0, iterations: 1, salt: Buffer.alloc(0), saltHex: '-' }), 'NSEC3PARAM iter 1 · salt -');
 });
 
 /* ------------------------------------------------------------------ *

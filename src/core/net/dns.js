@@ -16,10 +16,31 @@
 'use strict';
 
 const dns = require('node:dns').promises;
+const dgram = require('node:dgram');
+const net = require('node:net');
+const dnsPacket = require('dns-packet');
 const { NetlabError, CODES, wrap } = require('../errors');
 
 /** Resolvers publicos por defecto: se consulta fuera de la cache local. */
 const RESOLVERS_PUBLICOS = ['1.1.1.1', '8.8.8.8', '9.9.9.9'];
+
+/** Puerta DNS para las consultas crudas. */
+const PORT_DNS = 53;
+
+/**
+ * Tamano de respuesta UDP que pedimos por EDNS. Con 512 bytes, un dominio
+ * firmado con DNSSEC responde truncado casi siempre y obliga a TCP.
+ */
+const MAX_UDP_PAYLOAD = 1200;
+
+/**
+ * Tipos de registro DNSSEC.
+ *
+ * Node no sabe resolverlos: `Resolver.resolve()` lanza `ERR_INVALID_ARG_VALUE`
+ * para DNSKEY y DS, y `resolveAny` los ignora. Se consultan con un paquete DNS
+ * crudo (UDP con EDNS y bit DO, con caida a TCP si llega truncado).
+ */
+const TIPOS_DNSSEC = ['DNSKEY', 'DS', 'RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM'];
 
 /**
  * Crea un resolver apuntando a servidores especificos, evitando la cache local.
@@ -174,14 +195,20 @@ async function consultar(nombre, tipo, options = {}) {
   // erroneo en un informe de diagnostico cuesta mas que no mostrarlo.
   const CON_TTL = new Set(['A', 'AAAA']);
 
-  const metodo = METODOS[String(tipo).toUpperCase()];
+  const tipoNormalizado = String(tipo).toUpperCase();
+
+  // DNSKEY, DS, RRSIG... no los resuelve Node: se hablan por la red con un
+  // paquete crudo. Mismo contrato, para que `consultarLote` los trate igual.
+  if (TIPOS_DNSSEC.includes(tipoNormalizado)) {
+    return consultarDnssec(nombre, tipoNormalizado, { servers, timeout, reintentos });
+  }
+
+  const metodo = METODOS[tipoNormalizado];
   if (!metodo) {
     throw new NetlabError(CODES.PARAM_INVALIDO, `Tipo de registro no soportado: ${tipo}.`, {
       remediation: `Tipos disponibles: ${Object.keys(METODOS).join(', ')}.`
     });
   }
-
-  const tipoNormalizado = String(tipo).toUpperCase();
 
   try {
     const bruto = await conReintento(
@@ -239,6 +266,242 @@ function normalizar(tipo, bruto) {
 
   if (tipo === 'CNAME' || tipo === 'NS') return { valores: registros.map(String), ttl };
   return { valores: registros, ttl };
+}
+
+/**
+ * Key Tag de una DNSKEY, segun el Apendice B del RFC 4034.
+ *
+ * Se calcula sobre la RDATA completa del registro (flags + protocolo +
+ * algoritmo + public key) en grupos de dos octetos. Pantallazo de la version
+ * de referencia, que es la unica con la que hay que coincidir de forma exacta:
+ *
+ *     for (ac = 0, i = 0; i < keysize; ++i)
+ *             ac += (i & 1) ? key[i] : key[i] << 8;
+ *     ac += (ac >> 16) & 0xFFFF;
+ *     return ac & 0xFFFF;
+ *
+ * Comprobado contra el vector que trae el propio RFC (`dskey.example.com`,
+ * key id 60485) y contra el DS publicado de cloudflare.com (keyTag 2371).
+ *
+ * @param {{flags: number, algorithm: number, key: Buffer}} dnskey
+ * @returns {number}
+ */
+function keyTagDeDnsKey({ flags, algorithm, key }) {
+  const rdata = Buffer.alloc(4 + key.length);
+  rdata.writeUInt16BE(flags, 0);
+  rdata[2] = 3; // El protocolo DNSSEC siempre es 3.
+  rdata[3] = algorithm;
+  key.copy(rdata, 4);
+
+  let ac = 0;
+  for (let i = 0; i < rdata.length; i++) ac += i % 2 ? rdata[i] : rdata[i] << 8;
+  ac += (ac >> 16) & 0xffff;
+  return ac & 0xffff;
+}
+
+/** Manda un paquete DNS por UDP y resuelve con el primer mensaje que llega. */
+function consultarUdp(paquete, servidor) {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket('udp4');
+    socket.once('error', (error) => {
+      socket.close();
+      reject(error);
+    });
+    socket.once('message', (mensaje) => {
+      socket.close();
+      resolve(mensaje);
+    });
+    socket.send(paquete, PORT_DNS, servidor);
+  });
+}
+
+/** Manda un paquete DNS por TCP (prefijo de longitud) y devuelve la respuesta. */
+function consultarTcp(paquete, servidor) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(PORT_DNS, servidor);
+    const tropiezos = [];
+    let recibido = 0;
+
+    socket.once('error', (error) => {
+      socket.destroy();
+      reject(error);
+    });
+
+    socket.on('data', (trozo) => {
+      tropiezos.push(trozo);
+      recibido += trozo.length;
+      if (recibido < 2) return;
+      const cabecera = Buffer.concat(tropiezos);
+      const longitud = cabecera.readUInt16BE(0);
+      if (recibido >= longitud + 2) {
+        socket.destroy();
+        resolve(cabecera.slice(2, longitud + 2));
+      }
+    });
+
+    const marco = Buffer.alloc(paquete.length + 2);
+    marco.writeUInt16BE(paquete.length, 0);
+    paquete.copy(marco, 2);
+    socket.write(marco);
+  });
+}
+
+/** RCODEs del DNS que tienen traduccion al codigo que usa la herramienta. */
+const RCODE_CODIGO = {
+  NXDOMAIN: 'ENOTFOUND',
+  SERVFAIL: 'ESERVFAIL',
+  REFUSED: 'EREFUSED',
+  NOTAUTH: 'ENOTAUTH',
+  NOTIMP: 'ENOTIMP',
+  FORMERR: 'EFORMERR'
+};
+
+/** RCODEs que son respuesta definitiva y no merecen probar otro resolver. */
+const RCODE_DEFINITIVO = new Set(['ENOTFOUND', 'ESERVFAIL']);
+
+/** Serial RRSIG (segundos desde la epoca) a una fecha corta. */
+function serialAFecha(serial) {
+  if (typeof serial !== 'number' || serial < 1000000000 || serial > 2000000000) return null;
+  return new Date(serial * 1000).toISOString().slice(0, 10);
+}
+
+/** NSEC3PARAM no tiene decodificador en dns-packet: llega crudo. Se parsea. */
+function decodificarNsec3Param(crudo) {
+  if (!Buffer.isBuffer(crudo) || crudo.length < 5) return { algoritmo: null, iteraciones: null, salt: null };
+  const algoritmo = crudo.readUInt8(0);
+  const flags = crudo.readUInt8(1);
+  const iteraciones = crudo.readUInt16BE(2);
+  const largoSalt = crudo.readUInt8(4);
+  const salt = crudo.slice(5, 5 + largoSalt);
+  return { algorithm: algoritmo, flags, iterations: iteraciones, salt };
+}
+
+/** Deja cada tipo DNSSEC en una forma estable para los formateadores. */
+function enriquecerDnssec(tipo, dato) {
+  switch (tipo) {
+    case 'DNSKEY':
+      return { flags: dato.flags, algorithm: dato.algorithm, key: dato.key, keyTag: keyTagDeDnsKey(dato) };
+    case 'DS':
+      return { ...dato, digestHex: dato.digest.toString('hex') };
+    case 'RRSIG':
+      return { ...dato, expira: serialAFecha(dato.expiration) };
+    case 'NSEC3':
+      return {
+        ...dato,
+        saltHex: dato.salt.length ? dato.salt.toString('hex') : '-',
+        hashHex: dato.nextDomain.toString('hex').slice(0, 32)
+      };
+    case 'NSEC3PARAM':
+      return {
+        ...decodificarNsec3Param(dato),
+        saltHex: dato?.salt?.length ? dato.salt.toString('hex') : '-'
+      };
+    default:
+      return dato;
+  }
+}
+
+/** Extrae los valores del tipo pedido y el TTL minimo de una respuesta cruda. */
+function normalizarDnssec(tipo, decodificado) {
+  const delTipo = (decodificado.answers || []).filter((a) => String(a.type).toUpperCase() === tipo && a.data != null);
+  const valores = delTipo.map((a) => enriquecerDnssec(tipo, a.data));
+  let ttl = delTipo.length ? Math.min(...delTipo.map((a) => a.ttl)) : null;
+
+  // Sin registros (NODATA), el TTL que importa es el negativo del SOA de la
+  // autoridad: dice cuanto se cachea la ausencia.
+  if (ttl === null) {
+    const soa = (decodificado.authorities || []).find((a) => a.type === 'SOA');
+    if (soa) ttl = Math.min(soa.ttl, soa.data?.minttl ?? soa.ttl);
+  }
+
+  return { valores, ttl };
+}
+
+/** Convierte una respuesta cruda descodificada en el contrato de `consultar`. */
+function interpretarDnssec(decodificado, tipo) {
+  const ad = decodificado.flag_ad === true;
+  const rcode = decodificado.rcode || 'NOERROR';
+
+  if (rcode === 'NOERROR') {
+    const { valores, ttl } = normalizarDnssec(tipo, decodificado);
+    return { ok: true, valores, ttl, error: null, codigo: null, codigoDns: null, ad };
+  }
+
+  return {
+    ok: false,
+    valores: [],
+    ttl: null,
+    error: `El servidor de nombres devolvió ${rcode}`,
+    codigo: 'RED',
+    codigoDns: RCODE_CODIGO[rcode] || null,
+    ad
+  };
+}
+
+/**
+ * Consulta un registro DNSSEC hablando DNS por la red de forma directa.
+ *
+ * Node no expone los tipos DNSSEC (ver TIPOS_DNSSEC), asi que aqui se arma el
+ * paquete, se manda por UDP con EDNS y el bit DO (para que el resolver incluya
+ * las firmas) y, si la respuesta llega truncada, se repite por TCP. Se proban
+ * los resolvers en orden; NXDOMAIN y SERVFAIL son respuestas definitivas y
+ * cortan, los fallos de red pasan al siguiente resolver.
+ *
+ * @param {string} nombre Nombre a consultar.
+ * @param {string} tipo Tipo DNSSEC ('DNSKEY', 'DS', 'RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM').
+ * @param {object} [options]
+ * @param {string[]} [options.servers]
+ * @param {number} [options.timeout=5000]
+ * @returns {Promise<{ok: boolean, valores: any[], ttl: number|null, error: string|null, codigo: string|null, codigoDns: string|null, ad: boolean}>}
+ *   Nunca lanza. `ad` es el bit AD del resolver: true si ha validado la cadena.
+ */
+async function consultarDnssec(nombre, tipo, options = {}) {
+  const { servers = RESOLVERS_PUBLICOS, timeout = 5000 } = options;
+  const tipoNormalizado = String(tipo).toUpperCase();
+  if (!TIPOS_DNSSEC.includes(tipoNormalizado)) {
+    throw new NetlabError(CODES.PARAM_INVALIDO, `Tipo de registro DNSSEC no soportado: ${tipo}.`, {
+      remediation: `Tipos disponibles: ${TIPOS_DNSSEC.join(', ')}.`
+    });
+  }
+
+  const paquete = dnsPacket.encode({
+    type: 'query',
+    id: (Math.random() * 0xffff) | 0,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ name: nombre, type: tipoNormalizado }],
+    additionals: [{ type: 'OPT', name: '.', udpPayloadSize: MAX_UDP_PAYLOAD, flags: dnsPacket.DNSSEC_OK }]
+  });
+
+  let ultimoError = null;
+
+  for (const servidor of servers) {
+    try {
+      const contexto = `consultando ${tipoNormalizado} de ${nombre}`;
+      const udp = await conTimeout(consultarUdp(paquete, servidor), timeout, contexto);
+      let decodificado = dnsPacket.decode(udp);
+
+      if (decodificado.flags & dnsPacket.TRUNCATED_RESPONSE) {
+        const tcp = await conTimeout(consultarTcp(paquete, servidor), timeout, `${contexto} por TCP`);
+        decodificado = dnsPacket.decode(tcp);
+      }
+
+      const resultado = interpretarDnssec(decodificado, tipoNormalizado);
+      if (!resultado.ok && RCODE_DEFINITIVO.has(resultado.codigoDns)) return resultado;
+      return resultado;
+    } catch (error) {
+      ultimoError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    valores: [],
+    ttl: null,
+    error: `No se pudo consultar ${tipoNormalizado} de ${nombre}: ${ultimoError?.message || 'sin respuesta'}`,
+    codigo: 'RED',
+    codigoDns: ultimoError?.code === 'TIMEOUT' ? 'ETIMEDOUT' : ultimoError?.code || null,
+    ad: false
+  };
 }
 
 /**
@@ -302,11 +565,14 @@ async function consultarLote(consultas, options = {}) {
 module.exports = {
   consultar,
   consultarLote,
+  consultarDnssec,
   consultarTTL,
   resolverPTR,
   crearResolver,
   limitarConcurrencia,
   conTimeout,
   conReintento,
+  keyTagDeDnsKey,
+  TIPOS_DNSSEC,
   RESOLVERS_PUBLICOS
 };

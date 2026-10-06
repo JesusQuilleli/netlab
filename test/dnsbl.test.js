@@ -570,3 +570,54 @@ test('sin zonas de Spamhaus no se hace la comprobacion de acceso', async () => {
   assert.equal(preguntadas, OTRAS.length, 'solo las zonas de la lista, sin canario');
   assert.equal(r.accesoSpamhaus, null);
 });
+
+// ---------------------------------------------------------------- DBL (dominios)
+
+test('un dominio limpio en DBL se consulta tal cual y sale "limpio"', async () => {
+  const r = await dnsbl.consultarDominio('ejemplo.com', {
+    accesoSpamhaus: false,
+    dns: conDns({ 'ejemplo.com.dbl.spamhaus.org': rnx() })
+  });
+
+  assert.equal(r.estado, dnsbl.ESTADOS.LIMPIA);
+  assert.equal(r.consultado, 'ejemplo.com');
+  assert.equal(r.codigo, null);
+});
+
+test('un dominio en DBL se detecta con su codigo de listado', async () => {
+  const r = await dnsbl.consultarDominio('ejemplo.com', {
+    accesoSpamhaus: false,
+    dns: conDns({ 'ejemplo.com.dbl.spamhaus.org': rtxt('127.0.1.2') })
+  });
+
+  assert.equal(r.estado, dnsbl.ESTADOS.LISTADA);
+  assert.equal(r.consultado, 'ejemplo.com');
+  assert.equal(r.codigo, '127.0.1.2');
+});
+
+test('un subdominio limpio hereda el listado del dominio del que cuelga', async () => {
+  const r = await dnsbl.consultarDominio('boletin.ejemplo.com', {
+    accesoSpamhaus: false,
+    dns: conDns({ 'boletin.ejemplo.com.dbl.spamhaus.org': rnx(), 'ejemplo.com.dbl.spamhaus.org': rtxt('127.0.1.2') })
+  });
+
+  assert.equal(r.estado, dnsbl.ESTADOS.LISTADA);
+  assert.equal(r.consultado, 'ejemplo.com', 'el listado esta en el padre, y se dice');
+});
+
+test('un dominio que no lo parece devuelve sin-datos, no una consulta inventada', async () => {
+  const r = await dnsbl.consultarDominio('no esto no es un dominio', { accesoSpamhaus: false });
+
+  assert.equal(r.estado, dnsbl.ESTADOS.SIN_DATOS);
+  assert.equal(r.consultado, null);
+  assert.match(r.error, /dominio/);
+});
+
+test('sin acceso a Spamhaus, un "limpio" de DBL pasa a "sin datos"', async () => {
+  const r = await dnsbl.consultarDominio('ejemplo.com', {
+    dns: conDns({ 'ejemplo.com.dbl.spamhaus.org': rnx() })
+  });
+
+  assert.equal(r.estado, dnsbl.ESTADOS.SIN_DATOS, 'el NXDOMAIN sin canario no prueba nada');
+  assert.ok(r.avisos.length, 'el aviso dice por que');
+});

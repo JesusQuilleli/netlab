@@ -44,7 +44,7 @@ const SIN_DATOS = 'sin-datos';
 /**
  * Las listas que se consultan por defecto.
  *
- * Son ocho de uso general y gratuitas. La eleccion es deliberadamente corta:
+ * Son siete de uso general y gratuitas. La eleccion es deliberadamente corta:
  * consultar cuarenta zonas cuesta tiempo y, sobre todo, cada lista que se apaga
  * sin avisar mete ruido en el informe. Si el usuario quiere mas, pide el
  * conjunto ampliado.
@@ -139,25 +139,15 @@ const LISTAS_CORTA = [
     ipv6: false,
     quitarUltimoOcteto: false,
     nota: 'Lista mantenida a mano. Solo contiene entradas confirmadas.'
-  },
-  {
-    clave: 'dronebl',
-    nombre: 'DroneBL',
-    proveedor: 'DroneBL',
-    categoria: 'correo',
-    zona: 'dnsbl.dronebl.org',
-    ipv6: false,
-    quitarUltimoOcteto: false,
-    nota: 'Zonas separadas por pais y por servicio.'
   }
 ];
 /**
- * Conjunto ampliado, para cuando con ocho no se ve lo que se busca.
+ * Conjunto ampliado, para cuando con siete no se ve lo que se busca.
  *
  * Se anaden las dos zonas que siguen respondiendo y no estan en la lista corta:
  * SBL y el nivel 3 de UCEPROTECT. Las dos vienen con la misma advertencia que
- * sus irmas, y el nivel 3 de UCEPROTECT es agresivo por definicion: mete IP de
- * servidores enteros por un solo aviso, asi que su opinion vale menos que la
+ * sus compañeras, y el nivel 3 de UCEPROTECT es agresivo por definicion: mete IP
+ * de servidores enteros por un solo aviso, asi que su opinion vale menos que la
  * del nivel 1.
  *
  * Lo que NO esta aqui, y conviene decir por que:
@@ -652,8 +642,106 @@ async function consultar(ip, opciones = {}) {
   };
 }
 
+/**
+ * Lista negra de DOMINIOS: Spamhaus DBL.
+ *
+ * A diferencia de las IP, un dominio se consulta tal cual: `<dominio>.` + zona.
+ * Las respuestas de listado viven en 127.0.1.0/24 (dominio listado por spam) y
+ * 127.0.2.0/24 (dominio al que una respuesta apunta a partes de un dominio de
+ * spam). La ausencia es NXDOMAIN, igual que en las listas de IP, y Spamhaus
+ * aplica la misma comprobacion de resolvedor registrado que a sus otras zonas.
+ *
+ * Si el dominio consultado es un subdominio, se prueba tambien el dominio del
+ * que cuelga hasta llegar al de dos etiquetas: DBL marca el registro de dominio
+ * y un "limpio" del subdominio podria ser que la marca este en el padre.
+ */
+const ZONA_DBL = 'dbl.spamhaus.org';
+
+const NOMBRE_DOMINIO_VALIDO = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i;
+
+/**
+ * Consulta la reputacion de un dominio en Spamhaus DBL.
+ *
+ * @param {string} dominio
+ * @param {object} [opciones]
+ * @param {object} [opciones.dns] Módulo DNS inyectable (para pruebas).
+ * @param {number} [opciones.timeout=8000]
+ * @param {boolean} [opciones.accesoSpamhaus=true] Comprobar antes si Spamhaus da datos a este resolvedor.
+ * @returns {Promise<{estado: string, dominio: string, consultado: string|null, codigo: string|null, error: string|null, avisos: string[]}>}
+ */
+async function consultarDominio(dominio, opciones = {}) {
+  const { dns = dnsNet, timeout = 8000, accesoSpamhaus = true } = opciones;
+  const avisos = [];
+
+  let candidatos = [];
+  if (NOMBRE_DOMINIO_VALIDO.test(String(dominio))) {
+    const etiquetas = String(dominio).toLowerCase().split('.');
+    while (etiquetas.length >= 2) {
+      candidatos.push(etiquetas.join('.'));
+      etiquetas.shift();
+    }
+  }
+  if (!candidatos.length) {
+    return {
+      estado: SIN_DATOS,
+      dominio: String(dominio),
+      consultado: null,
+      codigo: null,
+      error: `"${dominio}" no parece un nombre de dominio`
+    };
+  }
+
+  const consultas = [];
+  for (const c of candidatos) {
+    const nombre = `${c}.${ZONA_DBL}`;
+    const r = interpretarRespuesta(
+      (await dns.consultarLote([{ nombre, tipo: 'A' }], { concurrencia: 1, dns: { timeout, reintentos: 1 } }))[0]
+    );
+    consultas.push({ nombre, candidato: c, ...r });
+
+    // Primer listado encontrado: no tiene sentido seguir subiendo.
+    if (r.estado === LISTADA) break;
+  }
+
+  // Igual que en la consulta de IP: si Spamhaus no da datos a este resolvedor,
+  // un "limpio" de DBL no prueba nada.
+  if (accesoSpamhaus) {
+    const acceso = await detectarAccesoSpamhaus({ dns, timeout });
+    if (!acceso.hayDatos) {
+      const motivo =
+        `${acceso.motivo}. El "no listado" de DBL seria un "sin datos" para este resolvedor, ` +
+        'asi que no se puede confirmar la reputacion del dominio.';
+      consultas.forEach((c) => {
+        if (c.estado === LIMPIA) {
+          c.estado = SIN_DATOS;
+          c.error = motivo;
+        }
+      });
+      avisos.push(motivo);
+    }
+  }
+
+  // Se informa del estado del DOMINIO consultado: si el listado esta en el
+  // padre se dice, porque el emisor firma con su dominio y el registro pesa
+  // igual sobre cualquiera de sus subdominios.
+  const hallado = consultas.find((c) => c.estado === LISTADA);
+  const limpio = consultas.every((c) => c.estado === LIMPIA);
+  const estado = hallado ? LISTADA : limpio ? LIMPIA : SIN_DATOS;
+  const fallo = consultas.find((c) => c.estado === SIN_DATOS);
+
+  return {
+    estado,
+    dominio: String(dominio),
+    consultado: hallado ? hallado.candidato : consultas[consultas.length - 1]?.candidato || null,
+    codigo: hallado?.codigo || null,
+    error: estado === SIN_DATOS ? (fallo?.error || 'sin datos de DBL') : null,
+    avisos
+  };
+}
+
 module.exports = {
   consultar,
+  consultarDominio,
   nombreDeConsulta,
   octetosInvertidos,
   interpretarRespuesta,
@@ -664,5 +752,6 @@ module.exports = {
   AVISO_SPAMHAUS,
   CANARIO,
   DIAGNOSTICOS,
+  ZONA_DBL,
   ESTADOS: { LIMPIA, LISTADA, SIN_DATOS, SIN_APLICAR }
 };

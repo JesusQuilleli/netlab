@@ -43,7 +43,20 @@ const ID = 'dns-checker';
 /** Tipos que se consultan si el usuario no indica otros. */
 const TIPOS_POR_DEFECTO = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA'];
 
-/** Tipos que acepta el módulo de red. */
+/**
+ * Tipos de registro DNSSEC.
+ *
+ * Forman parte de `TIPOS_SOPORTADOS`, asi que se pueden pedir a mano, y ademas
+ * DNSKEY y DS se consultan solos cuando el usuario no recorta el chequeo (ver
+ * `consultarDnssecContexto`): con esas dos respuestas se decide si el dominio
+ * esta firmado y si la DS de la zona padre encaja con las claves publicadas.
+ * Los demas (RRSIG, NSEC, NSEC3, NSEC3PARAM) solo se piden a mano.
+ */
+const TIPOS_DNSSEC = ['DNSKEY', 'DS', 'RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM'];
+
+/** Con DNSKEY y DS se decide el estado de la cadena; el resto se pide a mano. */
+const DNSSEC_DIAGNOSTICOS = ['DNSKEY', 'DS'];
+
 /**
  * Tipos que se pueden pedir desde el formulario.
  *
@@ -51,7 +64,40 @@ const TIPOS_POR_DEFECTO = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA'
  * nombre sino de una dirección, así que consultarlo aquí no significa nada.
  * Tiene su propio campo, que es donde se introduce la IP.
  */
-const TIPOS_SOPORTADOS = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA', 'SRV'];
+const TIPOS_SOPORTADOS = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA', 'SRV', ...TIPOS_DNSSEC];
+
+/** Respuestas definitivas: un NXDOMAIN no se rellena de avisos. */
+const CODIGO_DEFINITIVO = 'ENOTFOUND';
+
+/** Nombre de cada algoritmo DNSSEC, para las celdas y los hallazgos. */
+const ALGORITMOS_DNSSEC = {
+  1: 'RSAMD5',
+  3: 'DSA',
+  5: 'RSASHA1',
+  6: 'DSA-NSEC3-SHA1',
+  7: 'RSASHA1-NSEC3-SHA1',
+  8: 'RSASHA256',
+  10: 'RSASHA512',
+  12: 'ECCGOST',
+  13: 'ECDSAP256SHA256',
+  14: 'ECDSAP384SHA384',
+  15: 'ED25519',
+  16: 'ED448'
+};
+
+/** Nombre de cada tipo de digerido del DS. */
+const DIGESTOS_DS = { 1: 'SHA-1', 2: 'SHA-256', 4: 'SHA-384' };
+
+function nombrarAlgoritmo(algorithm) {
+  return ALGORITMOS_DNSSEC[algorithm] || `algoritmo ${algorithm}`;
+}
+
+/** Rol de una DNSKEY a partir de sus flags (RFC 4034). */
+function rolClave(flags) {
+  if ((flags & 0x0001) !== 0) return 'KSK';
+  if ((flags & 0x0100) !== 0) return 'ZSK';
+  return `flags ${flags}`;
+}
 
 /** Resolvers con los que se compara cuando el usuario lo pide. */
 const RESOLVER_A_COMPARAR = [
@@ -78,7 +124,7 @@ const CAMPOS = [
     type: 'text',
     required: false,
     placeholder: 'A, AAAA, MX, TXT',
-    help: `Opcional, separados por comas. Si lo dejas vacío se consultan: ${TIPOS_POR_DEFECTO.join(', ')}. Al comparar contra un archivo no hace falta: los tipos se sacan del archivo.`
+    help: `Opcional, separados por comas. Si lo dejas vacío se consultan: ${TIPOS_POR_DEFECTO.join(', ')} (y se revisa el estado DNSSEC). Además puedes pedir registros DNSSEC a mano: ${TIPOS_DNSSEC.join(', ')}. Al comparar contra un archivo no hace falta: los tipos se sacan del archivo.`
   },
   {
     name: 'inversa',
@@ -207,6 +253,24 @@ async function ejecutar(params = {}, ctx = {}) {
     pintarResumen(result, mapa, dominio);
     pintarRegistros(result, registros);
 
+    // DNSSEC: con las 8 consultas por defecto, o si el usuario pidió algún
+    // registro DNSSEC a mano, se consulta DNSKEY y DS para leer el estado de
+    // la cadena. Un NXDOMAIN no se rellena de avisos de firma, y sin método
+    // (tests inyectados) simplemente se omite.
+    let dnssec = null;
+    const tiposPorDefecto = tipos.length === TIPOS_POR_DEFECTO.length && TIPOS_POR_DEFECTO.every((t) => tipos.includes(t));
+    const quiereDnss = tipos.some((t) => TIPOS_DNSSEC.includes(t));
+    const nombreInexistente = registros.some((r) => r.codigoDns === CODIGO_DEFINITIVO);
+    // Se entra si se pidió DNSSEC (a mano o por defecto) y hay forma de
+    // obtener los datos: el método de consulta directa, o bien DNSKEY/DS que
+    // ya hayan llegado en el lote pedido.
+    const dnssecDisponible = typeof dns.consultarDnssec === 'function';
+    const yaHayDatos = DNSSEC_DIAGNOSTICOS.some((t) => tipos.includes(t) && mapa.has(t));
+    if ((tiposPorDefecto || quiereDnss) && !nombreInexistente && (dnssecDisponible || yaHayDatos)) {
+      dnssec = await consultarDnssecContexto(result, { dns, dominio, tipos, mapa, timeout });
+      pintarDnssec(result, { dominio, dnssec });
+    }
+
     let ptr = null;
     if (ipInversa) {
       ptr = await consultarInversa(result, dns, ipInversa);
@@ -232,7 +296,7 @@ async function ejecutar(params = {}, ctx = {}) {
       diferencias = await compararResolvers(result, dns, dominio, tipos, timeout);
     }
 
-    revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmarc, comparo: Boolean(params.comparar), diferencias });
+    revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmarc, comparo: Boolean(params.comparar), diferencias, dnssec });
 
     return finalize(result, inicio);
   } catch (error) {
@@ -311,6 +375,80 @@ function pintarRegistros(result, registros) {
            : { valor: r.error, tone: 'bad' }
     ])
   });
+}
+
+/**
+ * Consulta DNSKEY y DS para el diagnostico DNSSEC, en paralelo.
+ *
+ * Si el usuario ya pidió alguno de los dos a mano, su resultado está en el
+ * `mapa` del lote y se reutiliza; los que falten se consultan ahora. Devuelve
+ * los dos juntos para que `revisar` pueda decidir sobrela cadena completa.
+ */
+async function consultarDnssecContexto(result, { dns, dominio, tipos, mapa, timeout }) {
+  const pendientes = DNSSEC_DIAGNOSTICOS.filter((tipo) => !tipos.includes(tipo));
+  const extra =
+    typeof dns.consultarDnssec === 'function' && pendientes.length
+      ? await Promise.all(
+          pendientes.map((tipo) =>
+            dns.consultarDnssec(dominio, tipo, { timeout, reintentos: 1 }).then((r) => ({ tipo, ...r }))
+          )
+        )
+      : [];
+
+  for (const r of extra) {
+    mapa.set(r.tipo, { ok: r.ok, valores: r.valores, ttl: r.ttl, error: r.error, codigo: r.codigo, codigoDns: r.codigoDns, ad: r.ad });
+    addLog(result, {
+      level: 'info',
+      channel: 'dns',
+      message: `${r.tipo} de ${dominio}: ${r.ok ? `${r.valores.length} encontrado${r.valores.length === 1 ? '' : 's'}` : `sin resultado (${r.codigoDns || 'error'})`}`
+    });
+  }
+
+  return {
+    activo: true,
+    dnskey: mapa.get('DNSKEY'),
+    ds: mapa.get('DS')
+  };
+}
+
+/** Cabecera y resumen del estado DNSSEC (solo cuando se consultó). */
+function pintarDnssec(result, { dominio, dnssec }) {
+  const { dnskey, ds } = dnssec;
+  const ad = Boolean(dnskey?.ad) || Boolean(ds?.ad);
+
+  const firmado = Boolean(dnskey?.ok && dnskey.valores.length);
+  const sinFirmar = Boolean(dnskey?.ok) && !dnskey.valores.length;
+  const dsConDatos = Boolean(ds?.ok && ds.valores.length);
+
+  const estado = firmado ? 'Firmado' : sinFirmar ? 'Sin firmar' : 'No se pudo comprobar';
+  addSummary(result, 'DNSSEC', estado, firmado ? 'ok' : sinFirmar ? 'neutral' : 'warn');
+
+  const claves = firmado
+    ? dnskey.valores.map((v) => `${rolClave(v.flags)} ${nombrarAlgoritmo(v.algorithm)} (keyTag ${v.keyTag})`).join(' · ')
+    : sinFirmar
+      ? 'Ninguna'
+      : '—';
+
+  const dsTexto = dsConDatos
+    ? ds.valores.length === 1
+      ? `1 DS (keyTag ${ds.valores[0].keyTag})`
+      : `${ds.valores.length} registros DS`
+    : ds?.ok
+      ? 'Ninguna'
+      : '—';
+
+  addSection(result, {
+    title: 'Estado DNSSEC',
+    kind: K.PARES,
+    items: [
+      ['Estado', estado, firmado ? 'ok' : sinFirmar ? 'neutral' : 'warn'],
+      ['Claves DNSKEY', claves],
+      ['DS en la zona padre', dsTexto],
+      ['Respuesta validada (AD)', ad ? 'Sí' : 'No']
+    ]
+  });
+
+  addLog(result, { level: 'info', channel: 'dns', message: `DNSSEC de ${dominio}: ${estado}` });
 }
 
 /** Resolución inversa, si se pidió. */
@@ -409,7 +547,7 @@ async function compararResolvers(result, dns, dominio, tipos, timeout) {
  * la consulta para no pagar ocho lookups y el informe se llenaba de avisos
  * sobre datos que no habias pedido.
  */
-function revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmarc: ctxDmarc, comparo, diferencias }) {
+function revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmarc: ctxDmarc, comparo, diferencias, dnssec }) {
   const pedido = (...nombres) => nombres.some((n) => tipos.includes(n));
   const quiereDirecciones = pedido('A', 'AAAA');
 
@@ -577,6 +715,93 @@ function revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmar
   if (comparo) {
     revisarDiferencias(result, dominio, diferencias);
   }
+
+  // El estado de la cadena DNSSEC se cierra el último: depende de DNSKEY y DS
+  // juntos, y no tiene sentido antes de saber si el nombre siquiera existe.
+  if (dnssec?.activo) {
+    revisarDnssec(result, { dominio, dnskey: dnssec.dnskey, ds: dnssec.ds });
+  }
+}
+
+/**
+ * Convierte DNSKEY + DS en un veredicto de DNSSEC.
+ *
+ * La regla de fondo es no confundir "no está firmado" con "no lo sé": la
+ * severidad sube solo cuando hay un desajuste entre lo que promete la zona
+ * padre (DS) y lo que publica el dominio (DNSKEY). Un dominio sin firmar es una
+ * decisión legítima y sale como información; un DS que no encaja rompe la
+ * resolución para los validadores y sale como error.
+ */
+function revisarDnssec(result, { dominio, dnskey, ds }) {
+  const firmado = Boolean(dnskey?.ok && dnskey.valores.length);
+  const dsConDatos = Boolean(ds?.ok && ds.valores.length);
+
+  if (!firmado) {
+    if (dsConDatos) {
+      addFinding(result, {
+        severity: SEVERIDADES.ERROR,
+        title: 'La zona padre tiene DS pero el dominio no publica las claves',
+        detail: `${dominio} no devuelve DNSKEY y sin embargo hay ${ds.valores.length} registro(s) DS apuntando a claves que no están. Un validador busca la clave que el DS promete, no la encuentra y la resolución acaba en SERVFAIL.`,
+        recommendation: 'Publica la DNSKEY correspondiente, o retira el DS de la zona padre si la clave ya no debe existir. DS y clave han de convivir.'
+      });
+    } else if (dnskey?.ok) {
+      addFinding(result, {
+        severity: SEVERIDADES.INFO,
+        title: 'Sin DNSSEC',
+        detail: `No hay ningún registro DNSKEY en ${dominio}, así que no está firmado. Sin firma no hay cadena que validar, pero tampoco la integridad que DNSSEC aporta.`,
+        recommendation: 'Firmar la zona es opcional y siempre exige coordinar el DS con la zona padre. Si el dominio no lo necesita, no es un fallo.'
+      });
+    } else {
+      addFinding(result, {
+        severity: SEVERIDADES.INFO,
+        title: 'No se pudo comprobar el estado DNSSEC',
+        detail: ds
+          ? 'La consulta de DNSKEY no devolvió nada utilizable, así que no se puede decir si el dominio está firmado o no.'
+          : 'Las consultas de DNSKEY y DS no respondieron. No hay datos para hablar de DNSSEC.',
+        recommendation: 'Revisa la conectividad y repite. Este aviso no significa que al dominio le falte algo.'
+      });
+    }
+    return;
+  }
+
+  const ksk = dnskey.valores.filter((v) => (v.flags & 0x0001) !== 0).length;
+  const algoritmos = [...new Set(dnskey.valores.map((v) => nombrarAlgoritmo(v.algorithm)))].join(', ');
+
+  addFinding(result, {
+    severity: SEVERIDADES.INFO,
+    title: 'Firmado con DNSSEC',
+    detail: `${dominio} publica ${dnskey.valores.length} clave(s), ${ksk} KSK, con algoritmo(s) ${algoritmos}.`,
+    recommendation: 'Planifica la rotación de claves: al cambiar una KSK, actualiza primero el DS de la zona padre y espera a la propagación antes de dar de baja la clave vieja.'
+  });
+
+  if (ds?.ok) {
+    if (!dsConDatos) {
+      addFinding(result, {
+        severity: SEVERIDADES.WARN,
+        title: 'Firmado pero sin DS en la zona padre',
+        detail: 'El dominio tiene DNSKEY pero la zona padre no publica ningún registro DS. Un validador estricto no puede construir la cadena de confianza desde la raíz.',
+        recommendation: 'Publica en la zona padre un DS con el keyTag y el algoritmo de la KSK. Es el paso que une la zona con la de arriba.'
+      });
+    } else {
+      const tagsPublicados = new Set(dnskey.valores.map((v) => v.keyTag));
+      const coinciden = ds.valores.filter((d) => tagsPublicados.has(d.keyTag));
+      if (!coinciden.length) {
+        addFinding(result, {
+          severity: SEVERIDADES.ERROR,
+          title: 'El DS no corresponde con ninguna clave publicada',
+          detail: `El DS anuncia ${ds.valores.map((d) => `keyTag ${d.keyTag}`).join(', ')}, pero el dominio publica ${[...tagsPublicados].map((t) => `keyTag ${t}`).join(', ')}. El validador no puede casar los dos lados.`,
+          recommendation: 'O el DS apunta a una clave retirada (actualízalo a la KSK actual) o falta publicar en la zona la KSK que el DS promete. Nuevo DS y clave han de convivir durante la transición.'
+        });
+      }
+    }
+  } else if (ds) {
+    addFinding(result, {
+      severity: SEVERIDADES.INFO,
+      title: 'El estado del DS no se pudo comprobar',
+      detail: 'El dominio está firmado, pero la consulta del DS no respondió: la cadena puede estar bien o rota.',
+      recommendation: 'Repite la consulta más tarde. Sin el DS no se puede dar la cadena por buena.'
+    });
+  }
 }
 
 /**
@@ -703,6 +928,28 @@ function formatear(valor) {
   if (valor.nsname !== undefined) return `${valor.nsname} (serial ${valor.serial})`; // SOA
   if (valor.issue !== undefined) return `${valor.critical ?? 0} issue "${valor.issue}"`; // CAA
   if (valor.name !== undefined) return valor.name; // PTR
+
+  // DNSSEC. El orden importa: varias claves comparten campos, y la forma de
+  // distinguirlas es el campo que les es propio.
+  if (Buffer.isBuffer(valor.key) && valor.flags !== undefined) {
+    return `${rolClave(valor.flags)} · ${nombrarAlgoritmo(valor.algorithm)} · keyTag ${valor.keyTag}`; // DNSKEY
+  }
+  if (Buffer.isBuffer(valor.digest)) {
+    const digesto = DIGESTOS_DS[valor.digestType] || `DS tipo ${valor.digestType}`;
+    return `keyTag ${valor.keyTag} · ${nombrarAlgoritmo(valor.algorithm)} · ${digesto} · ${valor.digestHex?.slice(0, 16) || valor.digest.toString('hex').slice(0, 16)}…`; // DS
+  }
+  if (valor.typeCovered && Buffer.isBuffer(valor.signature)) {
+    return `RRSIG ${valor.typeCovered} · ${nombrarAlgoritmo(valor.algorithm)} · keyTag ${valor.keyTag} · ${valor.signersName}${valor.expira ? ` · expira ${valor.expira}` : ''}`; // RRSIG
+  }
+  if (Array.isArray(valor.rrtypes)) {
+    if (Buffer.isBuffer(valor.nextDomain)) {
+      return `NSEC3 iter ${valor.iterations} · salt ${valor.saltHex ?? '-'} · ${valor.rrtypes.join(' ')}`;
+    }
+    return `NSEC → ${valor.nextDomain} · ${valor.rrtypes.join(' ')}`;
+  }
+  if (valor.flags !== undefined && valor.iterations !== undefined && valor.salt !== undefined) {
+    return `NSEC3PARAM iter ${valor.iterations} · salt ${valor.saltHex ?? '-'}`;
+  }
 
   return String(valor);
 }
@@ -1043,11 +1290,11 @@ function revisarArchivo(result, { resumen, sobrantes, nombreArchivo }) {
 module.exports = {
   id: ID,
   titulo: 'Comprobador de DNS',
-  descripcion: 'Consulta los registros de un dominio y avisa de lo que está mal: SPF, DMARC, IPv6, alias o discrepancias entre resolvers.',
+  descripcion: 'Consulta los registros de un dominio y avisa de lo que está mal: SPF, DMARC, IPv6, alias, DNSSEC o discrepancias entre resolvers.',
   sinRed: false,
   icon: '🌐',
   campos: CAMPOS,
   ejecutar,
   // Expuestos para poder probarlos sin red.
-  _internas: { normalizarDominio, normalizarIp, parseTipos, resumirValores, formatear, revisar, TIPOS_SOPORTADOS, TIPOS_POR_DEFECTO, RESOLVER_A_COMPARAR }
+  _internas: { normalizarDominio, normalizarIp, parseTipos, resumirValores, formatear, revisar, TIPOS_SOPORTADOS, TIPOS_POR_DEFECTO, TIPOS_DNSSEC, nombrarAlgoritmo, rolClave, RESOLVER_A_COMPARAR }
 };

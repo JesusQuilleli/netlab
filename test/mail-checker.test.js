@@ -47,6 +47,7 @@ function dnsMail(zonas = {}, extra = {}) {
 function dnsblFalso(config = {}) {
   const listadas = new Set(config.listadas || []);
   const sinDatos = config.sinDatos || 0;
+  const dbl = config.dbl; // 'limpio' | 'listada' | 'sin-datos'
   return {
     consultar: async (ip) => {
       const esta = listadas.has(ip);
@@ -58,7 +59,19 @@ function dnsblFalso(config = {}) {
           zonasListadas: esta ? ['zen.spamhaus.org'] : []
         }
       };
-    }
+    },
+    ...(dbl
+      ? {
+          consultarDominio: async (dominio) => ({
+            estado: dbl,
+            dominio,
+            consultado: dominio,
+            codigo: dbl === 'listada' ? '127.0.1.2' : null,
+            error: dbl === 'sin-datos' ? 'no registrado en Spamhaus' : null,
+            avisos: []
+          })
+        }
+      : {})
   };
 }
 
@@ -160,7 +173,7 @@ function firmarConDkim(emlSinFirma) {
   const parseado = mensajes.parsear(emlSinFirma);
   const cuerpoCanon = verificar.canonizarCuerpo(parseado.cuerpo, 'relaxed');
   const bh = crypto.createHash('sha256').update(cuerpoCanon).digest('base64');
-  const cabeceras = [...Object.keys(parseado.cabeceras), 'dkim-signature'];
+  const cabeceras = Object.keys(parseado.cabeceras);
   const valor = `v=1; a=rsa-sha256; c=relaxed/relaxed; d=ejemplo.com; s=probe; h=${cabeceras.join(':')}; bh=${bh}; b=`;
   const conFirma = { ...parseado, cabeceras: { ...parseado.cabeceras, 'dkim-signature': [valor] } };
   const canon = verificar.canonizarCabeceras(conFirma, cabeceras, 'relaxed');
@@ -570,6 +583,66 @@ test('una IP autorizada por el SPF y listada es un fallo', async () => {
 
   const sec = seccion(r, 'IPs autorizadas por el SPF');
   assert.ok(sec.rows.some((f) => f[0] === '198.51.100.7' && /^listada/.test(String(f[2]?.valor))));
+});
+
+test('un dominio del remitente en DBL hace fallar la reputación aun con la IP limpia', async () => {
+  const eml = firmarConDkim(emlAutenticado());
+  const r = await mail.ejecutar(
+    { analizarMensaje: true, mensajePegado: eml, listasNegras: true },
+    { dns: dnsDkimProbe(), dnsbl: dnsblFalso({ dbl: 'listada' }) }
+  );
+
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'Listas negras');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /DBL/);
+});
+
+test('un dominio en DBL es un fallo de reputación en modo dominio', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { ...entornoSano(), dnsbl: dnsblFalso({ dbl: 'listada' }) }
+  );
+
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'Listas negras');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /DBL/);
+
+  const registros = seccion(r, 'Registros y valores encontrados');
+  assert.ok(registros.rows.some((f) => f[1] === 'DBL'), 'la fila DBL queda a la vista en los registros');
+});
+
+test('DBL sin datos se dice en el detalle y no baja el veredicto', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { ...entornoSano(), dnsbl: dnsblFalso({ dbl: 'sin-datos' }) }
+  );
+
+  assert.equal(r.status, 'pass', `hallazgos: ${r.findings.map((f) => f.title).join(' ; ')}`);
+  assert.equal(valorResumen(r, 'Puntuación'), '10.0 / 10');
+  const fila = seccion(r, 'Comprobaciones').rows.find((f) => f[0] === 'Listas negras');
+  assert.match(fila[4], /DBL/, 'el detalle avisa de que DBL no respondio');
+});
+
+test('un correo sin List-Unsubscribe avisa pero no resta puntos', async () => {
+  const eml = firmarConDkim(
+    emlAutenticado()
+      .split('\n')
+      .filter((l) => !/^List-Unsubscribe/i.test(l))
+      .join('\n')
+  );
+  const r = await mail.ejecutar(
+    { analizarMensaje: true, mensajePegado: eml, listasNegras: true },
+    { dns: dnsDkimProbe(), dnsbl: dnsblFalso() }
+  );
+
+  assert.equal(r.status, 'warn', 'la ausencia de la cabecera avisa (hallazgo warn), igual que el resto del marco');
+  assert.equal(valorResumen(r, 'Puntuación'), '10.0 / 10', 'la ausencia de la cabecera no penaliza la nota');
+  const h = hallazgo(r, 'List-Unsubscribe');
+  assert.equal(h.severity, 'warn');
+  const fila = seccion(r, 'Comprobaciones').rows.find((f) => f[0] === 'Cabecera List-Unsubscribe');
+  assert.equal(fila[3], '0/0', 'peso 0 y estado warn: aviso informativo, nada que ganar ni perder');
 });
 
 /* ------------------------------------------------------------------ *
