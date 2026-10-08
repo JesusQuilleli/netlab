@@ -74,7 +74,9 @@ function consultarWhois(dominio, timeoutMs) {
       if (err) {
         resolve({ disponible: false, raw: null, error: err.message });
       } else {
-        resolve({ disponible: true, raw: data, error: null });
+        // El parser se aplica aqui: sin esto, `combinarResultados` recibia el
+        // texto crudo y todos los campos whois salian vacios en el informe.
+        resolve({ disponible: true, ...parsearWhois(data, dominio), raw: data, error: null });
       }
     });
   });
@@ -94,31 +96,38 @@ function parsearWhois(raw, dominio) {
     estados: [],
     nameservers: [],
     titular: null,
+    org: null,
     email: null,
     raw: raw.slice(0, 5000)
   };
 
   const patrones = {
     registrador: [/registrar:\s*(.+)/i, /sponsoring registrar:\s*(.+)/i, /registrar name:\s*(.+)/i],
-    creacion: [/creation date:\s*(.+)/i, /created:\s*(.+)/i, /registered:\s*(.+)/i, /registration date:\s*(.+)/i],
-    expiracion: [/expir(?:y|ation) date:\s*(.+)/i, /registry expiry date:\s*(.+)/i, /expires:\s*(.+)/i],
-    actualizacion: [/updated date:\s*(.+)/i, /last updated:\s*(.+)/i, /modified:\s*(.+)/i],
-    estado: [/status:\s*(.+)/i, /domain status:\s*(.+)/i],
-    nameserver: [/name server:\s*(.+)/i, /nserver:\s*(.+)/i, /nameserver:\s*(.+)/i],
-    titular: [/registrant:\s*(.+)/i, /owner:\s*(.+)/i],
-    email: [/email:\s*(.+)/i, /registrant email:\s*(.+)/i]
+    creacion: [/creation date:\s*(.+)/i, /registered:\s*(.+)/i, /registration date:\s*(.+)/i, /created:\s*(.+)/i],
+    expiracion: [/expir(?:y|ation) date:\s*(.+)/i, /registry expiry date:\s*(.+)/i, /expire:\s*(.+)/i, /expires:\s*(.+)/i],
+    actualizacion: [/updated date:\s*(.+)/i, /last updated:\s*(.+)/i, /changed:\s*(.+)/i, /modified:\s*(.+)/i],
+    estados: [/status:\s*(.+)/i, /domain status:\s*(.+)/i],
+    nameservers: [/name server:\s*(.+)/i, /nserver:\s*(.+)/i, /nameserver:\s*(.+)/i],
+    // La organizacion se guarda aparte y manda sobre el `registrant:`: en
+    // NIC.VE (y en otros registros) el registrant es un codigo de contacto
+    // (CON000073989) y el nombre real esta en el bloque `org:`.
+    org: [/^org:\s*(.+)/i, /registrant organization:\s*(.+)/i],
+    titular: [/registrant(?: name)?:\s*(.+)/i, /owner:\s*(.+)/i],
+    email: [/registrant email:\s*(.+)/i, /email:\s*(.+)/i]
   };
 
   for (const linea of lineas) {
-    const lower = linea.toLowerCase();
     for (const [campo, regexs] of Object.entries(patrones)) {
       for (const regex of regexs) {
         const match = linea.match(regex);
         if (match) {
-          const valor = match[1].trim();
-          if (campo === 'estado' || campo === 'nameserver') {
-            if (!resultado[campo]) resultado[campo] = [];
-            resultado[campo].push(valor);
+          let valor = match[1].trim();
+          if (campo === 'estados') {
+            valor = limpiarEstadoWhois(valor);
+            if (valor && !resultado.estados.includes(valor)) resultado.estados.push(valor);
+          } else if (campo === 'nameservers') {
+            const ns = valor.replace(/\.$/, '').toLowerCase();
+            if (ns && !resultado.nameservers.includes(ns)) resultado.nameservers.push(ns);
           } else if (!resultado[campo]) {
             resultado[campo] = valor;
           }
@@ -128,12 +137,37 @@ function parsearWhois(raw, dominio) {
     }
   }
 
+  // La organizacion real gana al codigo de contacto del registrant.
+  if (resultado.org) resultado.titular = resultado.org;
+
   return resultado;
+}
+
+/**
+ * Los WHOIS devuelven los estados EPP pegados a la URL de ICANN y en
+ * camelCase: `clientTransferProhibited https://icann.org/epp#clientTransferProhibited`.
+ * En el informe eso es ilegible y repetido; se pasa a `client transfer
+ * prohibited` y se descarta la URL.
+ */
+function limpiarEstadoWhois(valor) {
+  const base = String(valor).trim().split(/\s+/)[0] || '';
+  if (!base || /^https?:/i.test(base)) return null;
+  return base.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
 }
 
 function formatearFecha(fechaStr) {
   if (!fechaStr) return null;
-  const fecha = new Date(fechaStr);
+  let texto = String(fechaStr).trim();
+
+  // Formato de NIC.VE y de otros registros: DD.MM.YYYY [HH:MM:SS]. JavaScript
+  // no lo interpreta de forma fiable (a veces lo toma como MM.DD), asi que se
+  // convierte a ISO antes de pasarlo por Date. Se anade Z: sin zona horaria,
+  // Date lo trata como hora local y el dia puede correrse un dia al pasar a
+  // UTC segun el TZ del servidor.
+  const ve = texto.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{1,2}:\d{2}:\d{2}))?$/);
+  if (ve) texto = `${ve[3]}-${ve[2]}-${ve[1]}T${ve[4] || '00:00:00'}Z`;
+
+  const fecha = new Date(texto);
   if (isNaN(fecha.getTime())) return fechaStr;
   return fecha.toISOString().split('T')[0];
 }
@@ -147,6 +181,21 @@ function diasHasta(fechaStr) {
 }
 
 function combinarResultados(rdap, whois, dominio) {
+  // RDAP devuelve los estados como texto pegado ("a, b, c") y WHOIS como
+  // lista; se unen y deduplican para que la tabla salga completa venga de
+  // donde venga.
+  const estadosRdap = rdap?.estados
+    ? String(rdap.estados).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : [];
+  const estadosWhois = Array.isArray(whois?.estados) ? whois.estados : [];
+  const estados = [...new Set([...estadosRdap, ...estadosWhois])];
+
+  const nsRdap = Array.isArray(rdap?.nombreservers)
+    ? rdap.nombreservers.map((n) => String(n).replace(/\.$/, '').toLowerCase()).filter(Boolean)
+    : [];
+  const nsWhois = Array.isArray(whois?.nameservers) ? whois.nameservers : [];
+  const nameservers = [...new Set([...nsRdap, ...nsWhois])];
+
   const combinado = {
     dominio,
     fuente: rdap?.disponible ? 'rdap' : (whois?.disponible ? 'whois' : 'none'),
@@ -155,10 +204,11 @@ function combinarResultados(rdap, whois, dominio) {
     creacion: rdap?.registro ? formatearFecha(rdap.registro) : (whois?.creacion ? formatearFecha(whois.creacion) : null),
     expiracion: rdap?.caducidad ? formatearFecha(rdap.caducidad) : (whois?.expiracion ? formatearFecha(whois.expiracion) : null),
     actualizacion: rdap?.ultimoCambio ? formatearFecha(rdap.ultimoCambio) : (whois?.actualizacion ? formatearFecha(whois.actualizacion) : null),
-    estados: rdap?.estados ? rdap.estados.split(', ').map(s => s.trim()) : (whois?.estados || []),
-    nameservers: rdap?.nombreservers || whois?.nameservers || [],
+    estados,
+    nameservers,
     titular: rdap?.titular || whois?.titular || null,
-    email: rdap?.nota || whois?.email || null,
+    email: whois?.email || null,
+    nota: rdap?.nota || null,
     caducidad: rdap?.caducidad ? formatearFecha(rdap.caducidad) : (whois?.expiracion ? formatearFecha(whois.expiracion) : null),
     diasRestantes: null
   };
@@ -232,7 +282,9 @@ async function ejecutar(params = {}, ctx = {}) {
     ['Ultima actualizacion', datos.actualizacion || 'desconocida'],
     ['Dias hasta expiracion', datos.diasRestantes !== null ? `${datos.diasRestantes} dias` : 'desconocido'],
     ['Nameservers', datos.nameservers?.length ? datos.nameservers.join(', ') : 'desconocidos'],
-    ['Titular', datos.titular || 'privado/desconocido']
+    ['Titular', datos.titular || 'privado/desconocido'],
+    ['Email de contacto', datos.email || 'no publicado'],
+    ['Nota del registro', datos.nota || 'ninguna']
   ];
 
 addSection(result, {
@@ -276,23 +328,48 @@ addSection(result, {
     }
   }
 
-  // Estados del dominio
-  if (datos.estados?.length) {
+  // Estados del dominio: la tabla se pinta siempre, aunque venga vacia, para
+  // que el informe tenga la misma estructura sea cual sea la fuente.
+  addSection(result, {
+    id: 'estados',
+    title: 'Estados del Dominio',
+    kind: K.LISTA,
+    items: datos.estados?.length
+      ? datos.estados.map((e) => ({ value: e }))
+      : [{ value: 'El registro no publico estados para este dominio.' }]
+  });
+
+  // Nameservers: igual que arriba, siempre presente.
+  addSection(result, {
+    id: 'nameservers',
+    title: 'Nameservers',
+    kind: K.LISTA,
+    items: datos.nameservers?.length
+      ? datos.nameservers.map((ns) => ({ value: ns }))
+      : [{ value: 'El registro no publico nameservers para este dominio.' }]
+  });
+
+  // Si RDAP no cubrio el TLD y WHOIS si, se vuelca la respuesta cruda: es la
+  // unica forma de ver el dato completo (y de diagnosticar un parseo fallido).
+  if (!rdapData?.disponible && whoisData?.disponible && whoisData.raw) {
     addSection(result, {
-      id: 'estados',
-      title: 'Estados del Dominio',
-      kind: K.LISTA,
-      items: datos.estados.map(e => ({ value: e }))
+      id: 'whois-raw',
+      title: 'Respuesta WHOIS completa',
+      description: 'El registro no tiene RDAP para este TLD; estos son los datos crudos que devolvio el servidor WHOIS.',
+      kind: K.CODIGO,
+      value: whoisData.raw.slice(0, 8000)
     });
   }
 
-  // Nameservers
-  if (datos.nameservers?.length) {
-    addSection(result, {
-      id: 'nameservers',
-      title: 'Nameservers',
-      kind: K.LISTA,
-      items: datos.nameservers.map(ns => ({ value: ns }))
+  // Si ninguna fuente contesto, se avisa con la causa concreta. El caso mas
+  // comun en un VPS es que el puerto 43 saliente este bloqueado por el
+  // proveedor: sin eso, WHOIS no contesta nunca.
+  if (!rdapData?.disponible && !whoisData?.disponible) {
+    addFinding(result, {
+      severity: 'warn',
+      title: 'Ninguna fuente respondio',
+      detail: `RDAP: ${rdapData?.motivo || rdapData?.error || 'sin datos'}. WHOIS: ${whoisData?.error || 'sin datos'}.`,
+      recommendation: 'Si el servidor sale de un VPS, comprueba que el puerto 43 saliente no este bloqueado por el proveedor: es la causa mas comun de que WHOIS no conteste.'
     });
   }
 
@@ -321,5 +398,8 @@ module.exports = {
   icon: '📅',
   sinRed: false,
   campos: CAMPOS,
-  ejecutar
+  ejecutar,
+  // Exportados para las pruebas.
+  parsearWhois,
+  combinarResultados
 };
