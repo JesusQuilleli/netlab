@@ -438,21 +438,53 @@ section.error h2{color:var(--bad)}
 font-size:12.5px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.35)}
 .pie{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);color:var(--mid);font-size:12.5px;text-align:center}
 
-.shared-actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0;padding:16px;background:var(--paper);border:1px solid var(--line);border-radius:12px}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s ease}
+.shared-actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0;padding:16px;background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px rgba(15,23,42,.03)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s ease;text-decoration:none;line-height:1.1}
 .btn:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
 .btn-primary{background:var(--primary);color:white;border:none}
 .btn-primary:hover{background:var(--primary-hover)}
 .btn-secondary{background:var(--neu-bg);color:var(--ink);border:1px solid var(--line)}
-.btn-secondary:hover{background:var(--neu)}
+.btn-secondary:hover{background:#e7ecf5}
 .btn-link{color:var(--primary);background:transparent;border:none;padding:10px 8px}
 .btn-link:hover{text-decoration:underline}
 .btn svg{flex-shrink:0}
 .btn.copied{background:var(--ok);color:white}
 
+.shared-layout{display:flex;gap:24px;max-width:1200px;margin:0 auto;padding:24px 20px 40px;align-items:flex-start}
+.sidebar{width:240px;flex-shrink:0;position:sticky;top:24px;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px 16px;max-height:calc(100vh - 48px);overflow:auto;box-shadow:0 1px 2px rgba(15,23,42,.03)}
+.sidebar h3{margin:0 0 12px;font-size:12.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--mid);font-weight:700}
+.toc{margin:0;padding-left:0;list-style:none}
+.toc li{margin:0}
+.toc a{display:block;padding:8px 10px;border-radius:8px;color:var(--mid);text-decoration:none;font-size:13.5px;line-height:1.25;transition:all 0.12s ease;border-left:2px solid transparent}
+.toc a:hover{background:var(--bg);color:var(--ink)}
+.toc a.active{background:var(--primary-bg);color:var(--primary);border-left-color:var(--primary);font-weight:600}
+.toc a:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.hoja.with-sidebar{flex:1;min-width:0;margin:0;box-shadow:0 1px 2px rgba(15,23,42,.03)}
+
+.cabecera.shared{display:flex;flex-direction:column;gap:14px;background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);color:#f8fafc;padding:20px 24px;border-radius:12px;border:1px solid rgba(255,255,255,.08);box-shadow:0 1px 2px rgba(15,23,42,.08)}
+.cabecera.shared h1{color:#f8fafc;margin:6px 0 2px;font-size:26px;letter-spacing:-.01em}
+.cabecera.shared .sub{color:rgba(248,250,252,.85);margin:0}
+.cabecera.shared .veredicto{color:#f8fafc}
+.cabecera.shared .badge{align-self:flex-start;background:rgba(255,255,255,.15);color:#f8fafc;border:1px solid rgba(255,255,255,.25);backdrop-filter:saturate(140%) blur(4px)}
+.cabecera.shared code{background:rgba(15,23,42,.45);color:#f8fafc;border-color:rgba(255,255,255,.25)}
+.shared-badge{display:flex;align-items:center;gap:10px;align-self:flex-start;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.25);backdrop-filter:saturate(140%) blur(4px)}
+.shared-badge span{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}
+.netlab-logo{width:20px;height:20px;color:#f8fafc}
+.shared-meta{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;font-size:13.5px;color:rgba(248,250,252,.9)}
+.shared-meta .share-link{color:#f8fafc;text-decoration:none;padding:6px 10px;border-radius:999px;background:rgba(15,23,42,.45);border:1px solid rgba(255,255,255,.2);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shared-meta .share-link:hover{text-decoration:underline;background:rgba(15,23,42,.55)}
+.shared-meta .expira,.shared-meta .autor{opacity:.95;padding:4px 8px;border-radius:999px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18)}
+
+@media (max-width: 980px){
+  .shared-layout{flex-direction:column;padding:16px 12px 32px}
+  .sidebar{position:static;width:100%;max-height:none}
+  .hoja.with-sidebar{margin:0}
+  .shared-meta .share-link{max-width:240px}
+}
+
 @media print{
   body{background:#fff}
-  .hoja{max-width:none;padding:0}
+  .hoja,.hoja.with-sidebar{max-width:none;padding:0;margin:0}
   section{break-inside:avoid}
   .shared-actions,.sidebar,.shared-badge,.shared-meta{display:none}
   .cabecera.shared{border-radius:0;background:#0f172a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
