@@ -1,0 +1,149 @@
+root@host-cec05f:/opt/netlab# curl -I http://127.0.0.1:4310
+HTTP/1.1 200 OK
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+X-Frame-Options: DENY
+Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+Cache-Control: no-cache
+Accept-Ranges: bytes
+Last-Modified: Wed, 07 Oct 2026 20:03:10 GMT
+ETag: W/"15d-1a117f6757f"
+Content-Type: text/html; charset=UTF-8
+Content-Length: 349
+Date: Wed, 07 Oct 2026 20:31:29 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+
+root@host-cec05f:/opt/netlab# cat /etc/caddy/Caddyfile
+# Caddy al frente de web y API, en un solo dominio.
+#
+# `iunav-service.shop-mg.com` lo reemplaza deploy/instalar.sh con el subdominio real. Si este
+# archivo se copia a mano a /etc/caddy/Caddyfile, hay que hacer el cambio a mano.
+#
+# Decisiones ya tomadas (no reabrir):
+# - Un solo dominio para web y API. Al quedar en el mismo origen, el navegador
+#   nunca hace una peticion cross-origin, asi que CORS no llega a activarse y no
+#   hay cookie de sesion entre sitios distintos.
+# - TLS lo resuelve Caddy solo, con el certificado de Let's Encrypt renewal
+#   automatico. 443 abierto, 80 solo para el reto de validacion.
+# - El API nunca se expone: escucha en 127.0.0.1 y aqui se le manda trafico.
+
+iunav-service.shop-mg.com {
+        # Las subidas van multipart con archivos de hasta 25 MB (MAX_DOCUMENTO_MB).
+        # `request_body` es una directiva de nivel de sitio (experimental desde
+        # Caddy 2.10): NO va como subdirectiva de `reverse_proxy`, ahi el adaptador
+        # falla con "unrecognized subdirective request_body". Rechaza cuerpos de mas
+        # de 30 MB con 413 antes de leerlos, asi un cliente no nos obliga a
+        # bufferizar una subida gigante.
+        request_body {
+                max_size 30MB
+        }
+
+        # Quitar la cabecera `Server`: dice la version exacta de Caddy.
+        header {
+                -Server
+                Strict-Transport-Security "max-age=31536000; includeSubDomains"
+                X-Content-Type-Options "nosniff"
+                Referrer-Policy "strict-origin-when-cross-origin"
+        }
+
+        # El API.
+        handle /api/* {
+                reverse_proxy 127.0.0.1:4000 {
+                        # Si PostgreSQL cae, /api/health responde 503 y Caddy deja de
+                        # mandarle trafico en vez de reenviar errores al navegador.
+                        health_uri /api/health
+                        health_interval 30s
+                        health_timeout 5s
+                }
+        }
+
+        # La web (Next.js). Next ya lee las cabeceras X-Forwarded-* que Caddy anade,
+        # asi que `npm start` no necesita configuracion extra de proxy.
+        handle {
+                reverse_proxy 127.0.0.1:3000
+        }
+
+        # Lo que se sirve comprimido. Los PDF de reportes y los archivos ya subidos
+        # van sin comprimir: son bytes comprimidos y volver a comprimirlos no ayuda.
+        encode zstd gzip
+}
+
+# Nota sobre CSP: aqui no se define Content-Security-Policy a proposito. Next
+# inyecta scripts de arranque en linea para sus datos de servidor, y una CSP
+# razonable los bloquearia. Si se anade en el futuro, hay que usar nonce/hash de
+# las ramas experimentales de Next, no un allowlist generico.root@host-cec05f:/opt/netlab# journalctl -u caddy -n 50 --no-pager
+Oct 07 04:48:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348509.528179,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:48:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348539.5282128,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:49:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348569.5281487,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:49:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348599.5221725,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:50:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348629.5282025,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:50:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348659.5282238,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:51:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348689.5242465,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:51:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348719.528457,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:52:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348749.5286975,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:52:33 host-cec05f caddy[690423]: {"level":"error","ts":1791348753.712867,"logger":"http.log.error","msg":"dial tcp 127.0.0.1:3000: connect: connection refused","request":{"remote_ip":"64.111.93.169","remote_port":"32794","client_ip":"64.111.93.169","proto":"HTTP/1.1","method":"GET","host":"iunav-service.shop-mg.com","uri":"/","headers":{"Accept-Encoding":["gzip, deflate, br"],"Upgrade-Insecure-Requests":["1"],"Sec-Fetch-Mode":["cors"],"Connection":["close"],"User-Agent":["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"],"Accept":["text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"],"Accept-Language":["en-US,en;q=0.9"]},"tls":{"resumed":false,"version":772,"cipher_suite":4865,"proto":"http/1.1","server_name":"iunav-service.shop-mg.com","ech":false}},"duration":0.000376893,"status":502,"err_id":"3z8ytiicd","err_trace":"reverseproxy.statusError (reverseproxy.go:1695)"}
+Oct 07 04:52:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348779.5281446,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:53:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348809.5217018,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:53:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348839.5281281,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:54:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348869.531148,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:54:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348899.5281682,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:55:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348929.5287294,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:55:59 host-cec05f caddy[690423]: {"level":"info","ts":1791348959.5281413,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:56:29 host-cec05f caddy[690423]: {"level":"info","ts":1791348989.5217419,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:56:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349019.5281413,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:57:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349049.5282145,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:57:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349079.5281363,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:58:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349109.522148,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:58:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349139.5281434,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:59:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349169.528146,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 04:59:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349199.5281131,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:00:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349229.5281575,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:00:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349259.528124,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:01:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349289.5287585,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:01:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349319.528145,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:02:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349349.5226436,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:02:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349379.529485,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:03:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349409.5281198,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:03:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349439.5281415,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:04:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349469.5281184,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:04:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349499.5217133,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:05:25 host-cec05f caddy[690423]: {"level":"error","ts":1791349525.0620122,"logger":"http.log.error","msg":"dial tcp 127.0.0.1:3000: connect: connection refused","request":{"remote_ip":"74.7.244.57","remote_port":"47708","client_ip":"74.7.244.57","proto":"HTTP/2.0","method":"GET","host":"iunav-service.shop-mg.com","uri":"/robots.txt","headers":{"X-Openai-Host-Hash":["175728323"],"From":["oai-searchbot(at)openai.com"],"User-Agent":["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36; compatible; OAI-SearchBot/1.4; robots.txt; +https://openai.com/searchbot"],"Accept":["*/*"],"Accept-Encoding":["gzip,deflate,br"]},"tls":{"resumed":false,"version":772,"cipher_suite":4865,"proto":"h2","server_name":"iunav-service.shop-mg.com","ech":false}},"duration":0.000324408,"status":502,"err_id":"qryfacny4","err_trace":"reverseproxy.statusError (reverseproxy.go:1695)"}
+Oct 07 05:05:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349529.5241249,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:05:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349559.5282128,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:06:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349589.5282085,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:06:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349619.5219848,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:07:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349649.530339,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:07:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349679.5281248,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:08:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349709.5281677,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:08:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349739.528165,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:09:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349769.528192,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:4000","error":"Get \"http://127.0.0.1:4000/api/health\": dial tcp 127.0.0.1:4000: connect: connection refused"}
+Oct 07 05:09:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349799.5455444,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"host is up","host":"127.0.0.1:4000"}
+Oct 07 09:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791364709.7509205,"logger":"http.acme_client","msg":"got renewal info","names":["iunav-service.shop-mg.com"],"window_start":1796450736,"window_end":1796606185,"selected_time":1796499071,"recheck_after":1791389830.750908,"explanation_url":""}
+Oct 07 09:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791364709.8197458,"logger":"tls.cache.maintenance","msg":"updated and stored ACME renewal information","identifiers":["iunav-service.shop-mg.com"],"cert_hash":"cc3f38393b8582f870ecd5c5fcccdbfba757ea7ddfdc4a8247fe77451ae31713","ari_unique_id":"uyDKRwv-1-Wc-Y8JKqOMN0WxvNg.BekoT3E-PeOabzEvRRVmpgLP","cert_expiry":1799119291,"selected_time":1796454895,"next_update":1791389830.750908,"explanation_url":""}
+Oct 07 16:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791389909.7339242,"logger":"http.acme_client","msg":"got renewal info","names":["iunav-service.shop-mg.com"],"window_start":1796450736,"window_end":1796606185,"selected_time":1796574788,"recheck_after":1791410428.7339146,"explanation_url":""}
+Oct 07 16:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791389909.7361164,"logger":"tls.cache.maintenance","msg":"updated and stored ACME renewal information","identifiers":["iunav-service.shop-mg.com"],"cert_hash":"cc3f38393b8582f870ecd5c5fcccdbfba757ea7ddfdc4a8247fe77451ae31713","ari_unique_id":"uyDKRwv-1-Wc-Y8JKqOMN0WxvNg.BekoT3E-PeOabzEvRRVmpgLP","cert_expiry":1799119291,"selected_time":1796454895,"next_update":1791410428.7339146,"explanation_url":""}
+root@host-cec05f:/opt/netlab# systemctl status caddy --no-pager
+* caddy.service - Caddy
+     Loaded: loaded (/lib/systemd/system/caddy.service; enabled; vendor preset: enabled)
+     Active: active (running) since Wed 2026-10-07 04:18:29 UTC; 16h ago
+       Docs: https://caddyserver.com/docs/
+   Main PID: 690423 (caddy)
+      Tasks: 7 (limit: 309376)
+     Memory: 15.6M
+        CPU: 7.473s
+     CGroup: /system.slice/caddy.service
+             `-690423 /usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+
+Oct 07 05:07:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349649.530339,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:400...ection refused"}
+Oct 07 05:07:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349679.5281248,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:40...ection refused"}
+Oct 07 05:08:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349709.5281677,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:40...ection refused"}
+Oct 07 05:08:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349739.528165,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:400...ection refused"}
+Oct 07 05:09:29 host-cec05f caddy[690423]: {"level":"info","ts":1791349769.528192,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"HTTP request failed","host":"127.0.0.1:400...ection refused"}
+Oct 07 05:09:59 host-cec05f caddy[690423]: {"level":"info","ts":1791349799.5455444,"logger":"http.handlers.reverse_proxy.health_checker.active","msg":"host is up","host":"127.0.0.1:4000"}
+Oct 07 09:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791364709.7509205,"logger":"http.acme_client","msg":"got renewal info","names":["iunav-service.shop-mg.com"],"window_start":179...anation_url":""}
+Oct 07 09:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791364709.8197458,"logger":"tls.cache.maintenance","msg":"updated and stored ACME renewal information","identifiers":["iunav-service.shop-mg.co...
+Oct 07 16:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791389909.7339242,"logger":"http.acme_client","msg":"got renewal info","names":["iunav-service.shop-mg.com"],"window_start":179...anation_url":""}
+Oct 07 16:18:29 host-cec05f caddy[690423]: {"level":"info","ts":1791389909.7361164,"logger":"tls.cache.maintenance","msg":"updated and stored ACME renewal information","identifiers":["iunav-service.shop-mg.co...
+Hint: Some lines were ellipsized, use -l to show in full.
+root@host-cec05f:/opt/netlab#

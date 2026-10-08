@@ -641,14 +641,14 @@ function crearApp(opciones = {}) {
   });
 
   // Public endpoint para ver informe compartido (sin autenticación)
-  app.get('/r/:shareToken', async (req, res) => {
+app.get('/r/:shareToken', async (req, res) => {
     const share = historial.obtenerCompartido(req.params.shareToken);
     if (!share) {
       return res.status(410).type('html').send(
         '<!doctype html><meta charset="utf-8"><title>Enlace expirado</title>' +
         '<style>body{font:16px/1.5 system-ui;max-width:500px;margin:60px auto;padding:0 20px;text-align:center}</style>' +
         '<h1>Enlace expirado o revocado</h1>' +
-        '<p>Este enlace de compartición ya no es válido.</p>' +
+        '<p>Este enlace de compartici��n ya no es vǭlido.</p>' +
         '<p><a href="/">Volver a netlab</a></p>'
       );
     }
@@ -665,8 +665,18 @@ function crearApp(opciones = {}) {
     }
 
     try {
-      const pie = `Compartido desde netlab · Expira el ${new Date(share.expiraEn).toLocaleString('es-ES')}`;
-      const html = await formats.render(encontrado.result, 'html', { standalone: true, pie });
+      const pie = `Compartido desde netlab �� Expira el ${new Date(share.expiraEn).toLocaleString('es-ES')}`;
+      const shareUrl = `${req.protocol}://${req.get('host')}/r/${req.params.shareToken}`;
+      const shareExpira = new Date(share.expiraEn).toLocaleString('es-ES');
+      const shareAutor = share.owner;
+      const html = await formats.render(encontrado.result, 'html', {
+        standalone: true,
+        pie,
+        shared: true,
+        shareUrl,
+        shareExpira,
+        shareAutor
+      });
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
       res.end(html);

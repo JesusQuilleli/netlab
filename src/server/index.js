@@ -27,8 +27,8 @@ const { registro } = require('./herramientas');
 async function arrancar(opciones = {}) {
   config.cargar();
 
-  const host = opciones.host || config.leer('HOST') || '127.0.0.1';
-  const puerto = Number(opciones.port ?? config.leer('PORT') ?? 4310);
+  const host = opciones.host || config.leer('HOST') || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
+  const puerto = Number(process.env.PORT ?? opciones.port ?? config.leer('PORT') ?? 4310);
 
   const { app, auth, historial } = crearApp();
 

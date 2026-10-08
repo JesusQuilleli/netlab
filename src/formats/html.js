@@ -1,12 +1,12 @@
 /**
- * html.js — Reporte en HTML autonomo.
+ * html.js �?" Reporte en HTML autonomo.
  *
  * MODULO DE SALIDA. Es el formato que consume la vista de detalle de la web y
  * el que se abre con "Guardar como" desde el navegador. Se genera con el mismo
  * `Result` que el PDF para que la pantalla y lo descargado no puedan divergir.
  *
  * El CSS va incrustado a proposito: el archivo tiene que abrirse sin servidor,
- * copiarse a un correo o guardarse como evidencia y seguir viéndose igual.
+ * copiarse a un correo o guardarse como evidencia y seguir viendose igual.
  *
  * @module formats/html
  */
@@ -24,24 +24,39 @@ const { redact } = require('../core/redact');
  * @param {object} [options]
  * @param {boolean} [options.standalone=true] Envolver en documento completo.
  * @param {string} [options.pie]
+ * @param {boolean} [options.shared=false] Modo informe compartido (adds nav, branding, download buttons)
+ * @param {string} [options.shareUrl] URL del informe compartido
+ * @param {string} [options.shareExpira] Fecha expiracion del enlace
+ * @param {string} [options.shareAutor] Autor del informe
  * @returns {string}
  */
 function render(result, options = {}) {
-  const { standalone = true, pie = 'Generado automaticamente por netlab' } = options;
+  const {
+    standalone = true,
+    pie = 'Generado automaticamente por netlab',
+    shared = false,
+    shareUrl,
+    shareExpira,
+    shareAutor
+  } = options;
   const meta = STATUS_META[result.status] || STATUS_META.error;
 
+  const sharedHeader = shared ? renderSharedHeader(shareUrl, shareExpira, shareAutor) : '';
+
   const body = [
-    `<header class="cabecera">`,
+    `<header class="cabecera${shared ? ' shared' : ''}">`,
+    sharedHeader,
     `  <h1>${e(result.toolTitle)}</h1>`,
     result.headline ? `  <p class="veredicto">${e(result.headline)}</p>` : '',
-    `  <p class="sub">${e(meta.label)} · <code>${e(result.target || 'n/d')}</code> · ${e(human(result.startedAt))}</p>`,
+    `  <p class="sub">${e(meta.label)} �� <code>${e(result.target || 'n/d')}</code> �� ${e(human(result.startedAt))}</p>`,
     `  <span class="badge badge-${e(meta.tone)}">${e(meta.label)}</span>`,
     `</header>`,
+    shared ? renderSharedActions(shareUrl) : '',
     resumen(result),
     error(result),
     ...(result.sections || []).map(seccion),
     hallazgos(result),
-    `<footer class="pie">${e(pie)} · ${e(duration(result.durationMs))}</footer>`
+    `<footer class="pie">${e(pie)} �� ${e(duration(result.durationMs))}</footer>`
   ]
     .filter(Boolean)
     .join('\n');
@@ -53,15 +68,133 @@ function render(result, options = {}) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${e(result.headline || result.toolTitle)} — ${e(result.target || 'informe')}</title>
+<title>${e(result.headline || result.toolTitle)} �?" ${e(result.target || 'informe')}</title>
 <style>${CSS}</style>
 </head>
 <body>
-<main class="hoja">
+${shared ? '<div class="shared-layout"><nav class="sidebar" id="sidebar" aria-label="Navegacion del informe"></nav>' : ''}
+<main class="hoja${shared ? ' with-sidebar' : ''}" id="main-content">
 ${body}
 </main>
+${shared ? '</div>' : ''}
+${shared ? renderSidebarScript() : ''}
 </body>
 </html>`;
+}
+
+function renderSharedHeader(shareUrl, shareExpira, shareAutor) {
+  return `
+  <div class="shared-badge">
+    <svg class="netlab-logo" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="6" fill="currentColor"/><path d="M8 12h16M8 16h12M8 20h8" stroke="white" stroke-width="2.5" stroke-linecap="round"/></svg>
+    <span>Informe Compartido</span>
+  </div>
+  <div class="shared-meta">
+    ${shareUrl ? `<a class="share-link" href="${e(shareUrl)}" target="_blank" rel="noopener">${e(shareUrl)}</a>` : ''}
+    ${shareExpira ? `<span class="expira">Expira: ${e(shareExpira)}</span>` : ''}
+    ${shareAutor ? `<span class="autor">Compartido por: ${e(shareAutor)}</span>` : ''}
+  </div>`;
+}
+
+function renderSharedActions(shareUrl) {
+  return `
+<div class="shared-actions" role="group" aria-label="Acciones del informe">
+  <button class="btn btn-primary" onclick="downloadFormat('pdf')" aria-label="Descargar PDF">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+    <span>PDF</span>
+  </button>
+  <button class="btn btn-secondary" onclick="downloadFormat('json')" aria-label="Descargar JSON">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    <span>JSON</span>
+  </button>
+  <button class="btn btn-secondary" onclick="downloadFormat('txt')" aria-label="Descargar TXT">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+    <span>TXT</span>
+  </button>
+  <button class="btn btn-secondary" onclick="copyShareUrl()" aria-label="Copiar enlace">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+    <span>Copiar enlace</span>
+  </button>
+  <a class="btn btn-link" href="/" target="_blank" rel="noopener" aria-label="Volver a netlab">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+    <span>Volver a netlab</span>
+  </a>
+</div>`;
+}
+
+function renderSidebarScript() {
+  return `
+<script>
+(function() {
+  const sidebar = document.getElementById('sidebar');
+  const main = document.getElementById('main-content');
+  if (!sidebar || !main) return;
+
+  const headings = main.querySelectorAll('section h2');
+  if (!headings.length) return;
+
+  const toc = document.createElement('ol');
+  toc.className = 'toc';
+  headings.forEach((h, i) => {
+    const id = 'section-' + i;
+    h.id = id;
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = '#' + id;
+    a.textContent = h.textContent;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const target = document.getElementById(id);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    li.appendChild(a);
+    toc.appendChild(li);
+  });
+  sidebar.appendChild(toc);
+
+  // Highlight active section on scroll
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        document.querySelectorAll('.toc a').forEach(a => a.classList.remove('active'));
+        const active = document.querySelector('.toc a[href="#' + entry.target.id + '"]');
+        if (active) active.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  headings.forEach(h => observer.observe(h));
+})();
+
+function downloadFormat(fmt) {
+  const currentUrl = window.location.href;
+  const base = currentUrl.split('/r/')[0];
+  const token = currentUrl.split('/r/')[1];
+  if (!token) return alert('No se pudo determinar el token del informe');
+  window.open(base + '/api/run/' + token + '/' + fmt, '_blank');
+}
+
+function copyShareUrl() {
+  navigator.clipboard.writeText(window.location.href).then(() => {
+    const btn = event.target.closest('button');
+    const original = btn.innerHTML;
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg><span>Copiado!</span>';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.innerHTML = original; btn.classList.remove('copied'); }, 2000);
+  });
+}
+</script>`;
+}
+
+function renderSharedHeader(shareUrl, shareExpira, shareAutor) {
+  return `
+  <div class="shared-badge">
+    <svg class="netlab-logo" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="6" fill="currentColor"/><path d="M8 12h16M8 16h12M8 20h8" stroke="white" stroke-width="2.5" stroke-linecap="round"/></svg>
+    <span>Informe Compartido</span>
+  </div>
+  <div class="shared-meta">
+    ${shareUrl ? `<a class="share-link" href="${e(shareUrl)}" target="_blank" rel="noopener">${e(shareUrl)}</a>` : ''}
+    ${shareExpira ? `<span class="expira">Expira: ${e(shareExpira)}</span>` : ''}
+    ${shareAutor ? `<span class="autor">Compartido por: ${e(shareAutor)}</span>` : ''}
+  </div>`;
 }
 
 /** Bloque de resumen. */
@@ -198,11 +331,65 @@ function tonoPorValor(valor) {
 /** CSS incrustado. Sin dependencias ni fuentes externas. */
 const CSS = `
 :root{--ok:#10b981;--ok-bg:#d1fae5;--warn:#f59e0b;--warn-bg:#fef3c7;--bad:#ef4444;--bad-bg:#fee2e2;
---neu:#64748b;--neu-bg:#e2e8f0;--ink:#0f172a;--mid:#475569;--line:#e2e8f0;--paper:#ffffff;--bg:#f8fafc}
+--neu:#64748b;--neu-bg:#e2e8f0;--ink:#0f172a;--mid:#475569;--line:#e2e8f0;--paper:#ffffff;--bg:#f8fafc;
+--primary:#2563eb;--primary-hover:#1d4ed8;--primary-bg:#dbeafe;--secondary:#64748b;--secondary-hover:#475569}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 .hoja{max-width:900px;margin:0 auto;padding:32px 24px 64px}
+.cabecera{display:flex;flex-direction:column;gap:10px;margin-bottom:24px;padding-bottom:20px;border-bottom:1px solid var(--line)}
+.cabecera h1{margin:0;font-size:28px;letter-spacing:-.02em;color:var(--ink)}
+.cabecera .veredicto{margin:0;font-size:22px;font-weight:650;letter-spacing:-.01em}
+.cabecera .sub{margin:0;color:var(--mid);font-size:14.5px}
+.cabecera code{background:var(--neu-bg);padding:2px 8px;border-radius:6px;font-size:13px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:6px 16px;border-radius:999px;font-size:13px;font-weight:600;color:#fff}
+.badge-ok{background:var(--ok)}.badge-warn{background:var(--warn)}.badge-bad{background:var(--bad)}
+
+/* Shared header */
+.cabecera.shared{flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:space-between;padding:20px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);border-radius:16px 16px 0 0;border:none;color:white;margin:-24px -24px 24px}
+.cabecera.shared h1{color:white}
+.cabecera.shared .sub{color:rgba(255,255,255,0.8)}
+.cabecera.shared .veredicto{color:white}
+.cabecera.shared code{background:rgba(255,255,255,0.15);color:white}
+.cabecera.shared .badge{background:rgba(255,255,255,0.2);color:white;border:1px solid rgba(255,255,255,0.3)}
+
+.shared-badge{display:inline-flex;align-items:center;gap:10px;padding:8px 16px;background:rgba(255,255,255,0.15);border-radius:999px;border:1px solid rgba(255,255,255,0.2);backdrop-filter:blur(8px)}
+.netlab-logo{width:28px;height:28px;color:#2563eb;flex-shrink:0}
+.shared-badge span{font-weight:600;font-size:14px;color:white}
+.shared-meta{display:flex;flex-wrap:wrap;align-items:center;gap:16px;font-size:13px;color:rgba(255,255,255,0.8)}
+.share-link{color:#93c5fd;text-decoration:none;word-break:break-all;max-width:300px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.share-link:hover{color:#bfdbfe;text-decoration:underline}
+.expira{background:rgba(245,158,11,0.2);color:#fde68a;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:500}
+.autor{color:rgba(255,255,255,0.7);font-size:13px}
+
+.shared-actions{display:flex;flex-wrap:wrap;gap:10px;margin:20px 0;padding:16px;background:var(--paper);border:1px solid var(--line);border-radius:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s ease;text-decoration:none}
+.btn:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.btn-primary{background:var(--primary);color:white;border:none}
+.btn-primary:hover{background:var(--primary-hover)}
+.btn-secondary{background:var(--neu-bg);color:var(--ink);border:1px solid var(--line)}
+.btn-secondary:hover{background:var(--neu);color:var(--ink)}
+.btn-link{color:var(--primary);background:transparent;border:none;padding:10px 8px}
+.btn-link:hover{text-decoration:underline}
+.btn svg{flex-shrink:0}
+.btn.copied{background:#10b981;color:white}
+
+.shared-layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}
+.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;overflow-y:auto;background:var(--paper);border-right:1px solid var(--line)}
+.toc{list-style:none;padding:0;margin:0}
+.toc li{margin:0}
+.toc a{display:block;padding:8px 12px;border-radius:8px;font-size:13.5px;color:var(--mid);text-decoration:none;transition:all 0.1s}
+.toc a:hover{background:var(--neu-bg);color:var(--ink)}
+.toc a.active{background:var(--primary-bg);color:var(--primary);font-weight:600}
+.hoja.with-sidebar{max-width:none;margin:0;padding:0}
+@media (max-width: 1024px){
+  .shared-layout{grid-template-columns:1fr}
+  .sidebar{position:fixed;left:0;top:0;bottom:0;width:280px;z-index:50;transform:translateX(-100%);transition:transform 0.2s ease;box-shadow:4px 0 20px rgba(0,0,0,0.1)}
+  .sidebar.open{transform:translateX(0)}
+  .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:40}
+  .sidebar-overlay.visible{display:block}
+}
+
 .cabecera h1{margin:0 0 4px;font-size:26px;letter-spacing:-.02em}
 .cabecera .veredicto{margin:0 0 6px;font-size:21px;font-weight:650;letter-spacing:-.01em}
 .cabecera .sub{margin:0 0 12px;color:var(--mid);font-size:14px}
@@ -250,7 +437,26 @@ section.error h2{color:var(--bad)}
 .meter span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 font-size:12.5px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.35)}
 .pie{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);color:var(--mid);font-size:12.5px;text-align:center}
-@media print{body{background:#fff}.hoja{max-width:none;padding:0}section{break-inside:avoid}}
+
+.shared-actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0;padding:16px;background:var(--paper);border:1px solid var(--line);border-radius:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s ease}
+.btn:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.btn-primary{background:var(--primary);color:white;border:none}
+.btn-primary:hover{background:var(--primary-hover)}
+.btn-secondary{background:var(--neu-bg);color:var(--ink);border:1px solid var(--line)}
+.btn-secondary:hover{background:var(--neu)}
+.btn-link{color:var(--primary);background:transparent;border:none;padding:10px 8px}
+.btn-link:hover{text-decoration:underline}
+.btn svg{flex-shrink:0}
+.btn.copied{background:var(--ok);color:white}
+
+@media print{
+  body{background:#fff}
+  .hoja{max-width:none;padding:0}
+  section{break-inside:avoid}
+  .shared-actions,.sidebar,.shared-badge,.shared-meta{display:none}
+  .cabecera.shared{border-radius:0;background:#0f172a !important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+}
 `;
 
 module.exports = { render, escapeHtml };
