@@ -642,6 +642,16 @@ function crearApp(opciones = {}) {
 
   // Public endpoint para ver informe compartido (sin autenticación)
 app.get('/r/:shareToken', async (req, res) => {
+    // El informe compartido es un documento autónomo: su CSS va en un <style>
+    // inline y su navegacion en un <script> inline, a proposito (tiene que
+    // abrirse sin servidor, guardarse como evidencia y seguir viendose igual).
+    // El CSP global es `default-src 'self'`, que bloquea ambos y deja el
+    // informe en HTML crudo sin estilos. Se relaja solo para esta ruta, sin
+    // abrir ningun origen externo.
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    );
     const share = historial.obtenerCompartido(req.params.shareToken);
     if (!share) {
       return res.status(410).type('html').send(
