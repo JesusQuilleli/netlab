@@ -9,6 +9,7 @@ const { validar } = require('../src/server/validar');
 const herramientas = require('../src/server/herramientas');
 const { crearApp } = require('../src/server/app');
 const formats = require('../src/formats');
+const { Backup } = require('../src/server/backup');
 
 const { createResult, addSection, finalize } = require('../src/core/result');
 const { CODES } = require('../src/core/errors');
@@ -866,4 +867,124 @@ test('la creacion del administrador principal queda auditada', async () => {
     assert.equal(r.cuerpo.items[0].usuario, 'admin');
     assert.ok(r.cuerpo.items[0].ip, 'el evento guarda la IP de origen');
   });
+});
+
+// ==================================================== compartir y revocar
+
+test('revocar un enlace inexistente da 404 en json, no un 500', async () => {
+  // ESTA PRUEBA EXISTE POR UN FALLO REAL: el handler leia `revogado` (con g) y
+  // nunca habia definido esa variable. La revocacion funcionaba escribiendo la
+  // auditoria primero (con el tipo mal escrito) y luego reventaba con un
+  // ReferenceError que terminaba en 500. Hasta el error daba una respuesta que
+  // no era la de la persona que intenta revocar un enlace ya muerto.
+  await conServidor({}, async ({ pedir }) => {
+    const r = await pedir('/api/compartir/nunca-existio', { metodo: 'DELETE' });
+    assert.equal(r.status, 404);
+    assert.equal(r.cuerpo.revocado, false);
+    assert.equal(r.cuerpo.error, undefined, 'la revocacion fallida responde en formato de revocacion');
+  });
+});
+
+test('revocar un enlace que si existe devuelve 200 y lo audita con el tipo correcto', async () => {
+  const { Auditoria } = require('../src/server/auditoria');
+  await conServidor({ auditoria: new Auditoria({ ruta: ':memory:' }) }, async ({ pedir }) => {
+    const run = await pedir('/api/run', { metodo: 'POST', cuerpo: { tool: 'subnet-analyzer', params: { red: '10.0.0.0/24' } } });
+    const compartido = await pedir('/api/compartir', { metodo: 'POST', cuerpo: { ejecucionId: run.cuerpo.id } });
+    assert.equal(compartido.status, 200);
+
+    const token = compartido.cuerpo.shareUrl.split('/').pop();
+    const revocado = await pedir(`/api/compartir/${token}`, { metodo: 'DELETE' });
+    assert.equal(revocado.status, 200, 'revocar un enlace vivo no puede ser un 500');
+    assert.equal(revocado.cuerpo.revocado, true);
+
+    // El tipo de evento es el del enumerado, no un texto pegado a mano: la
+    // interfaz de auditoria agrupa por tipo, y un typo partiria la historia en dos.
+    const log = await pedir('/api/auditoria?tipo=compartir_revocado');
+    assert.equal(log.cuerpo.total, 1);
+    assert.equal(log.cuerpo.items[0].detalles.shareToken, token);
+  });
+});
+
+// ================================================================= backups
+
+/** Base de fichero de mentira para que VACUUM INTO tenga algo que copiar. */
+function baseDeFichero() {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { DatabaseSync } = require('node:sqlite');
+  const directorio = fs.mkdtempSync(path.join(os.tmpdir(), 'netlab-server-backup-'));
+  const ruta = path.join(directorio, 'netlab.db');
+  const db = new DatabaseSync(ruta);
+  db.exec('CREATE TABLE t (a INTEGER)');
+  db.prepare('INSERT INTO t VALUES (?)').run(7);
+  db.close();
+  return { ruta, directorio };
+}
+
+test('GET /api/backups solo lo ve quien puede administrar', async () => {
+  const { Usuarios } = require('../src/server/usuarios');
+  const usuarios = new Usuarios({ ruta: ':memory:' });
+  usuarios.crear({ username: 'ana', password: 'password123', role: 'admin' });
+  const { ruta, directorio } = baseDeFichero();
+  const fs = require('node:fs');
+  try {
+    await conServidor({ auth: new Auth({ activo: true, usuarios }), backup: new Backup({ ruta, directorio }) }, async ({ pedir, entrar }) => {
+      assert.equal((await pedir('/api/backups')).status, 401, 'sin sesion no se lista nada');
+      const sesion = await entrar('ana', 'password123');
+      const r = await pedir('/api/backups', { cabeceras: sesion.cabeceras });
+      assert.equal(r.status, 200);
+      assert.equal(Array.isArray(r.cuerpo.backups), true);
+      assert.equal(r.cuerpo.retencion, 7);
+      assert.equal(r.cuerpo.hora, 3);
+    });
+  } finally {
+    fs.rmSync(directorio, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/backups crea una copia y deja rastro en la auditoria', async () => {
+  const { Auditoria } = require('../src/server/auditoria');
+  const fs = require('node:fs');
+  const { ruta, directorio } = baseDeFichero();
+  try {
+    await conServidor({ auditoria: new Auditoria({ ruta: ':memory:' }), backup: new Backup({ ruta, directorio }) }, async ({ pedir }) => {
+      const hecho = await pedir('/api/backups', { metodo: 'POST' });
+      assert.equal(hecho.status, 201, 'una copia bien hecha responde 201');
+      assert.ok(hecho.cuerpo.backup.nombre, 'el nombre de la copia');
+      assert.ok(hecho.cuerpo.backup.tamano > 0, 'la copia pesa algo');
+
+      const lista = await pedir('/api/backups');
+      assert.equal(lista.cuerpo.backups.length, 1);
+
+      const log = await pedir('/api/auditoria?tipo=backup_realizado');
+      assert.equal(log.cuerpo.total, 1);
+      assert.equal(log.cuerpo.items[0].detalles.nombre, hecho.cuerpo.backup.nombre);
+
+      // Una segunda copia deja dos. El nombre lleva segundos, asi que hay que
+      // esperar a que cambie: dos copias en el mismo segundo son la misma.
+      await new Promise((r) => setTimeout(r, 1100));
+      assert.equal((await pedir('/api/backups', { metodo: 'POST' })).status, 201);
+      assert.equal((await pedir('/api/backups')).cuerpo.backups.length, 2);
+    });
+  } finally {
+    fs.rmSync(directorio, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/backups sin base responde el error con recomendacion', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const directorio = fs.mkdtempSync(path.join(os.tmpdir(), 'netlab-server-backup-'));
+  try {
+    await conServidor({ backup: new Backup({ ruta: path.join(directorio, 'no-existe.db'), directorio }) }, async ({ pedir }) => {
+      const r = await pedir('/api/backups', { metodo: 'POST' });
+      assert.equal(r.status, 404);
+      assert.equal(r.cuerpo.error.code, 'FICHERO_NO_ENCONTRADO');
+      assert.ok(r.cuerpo.error.remediation, 'se dice que hacer con el fallo');
+    });
+  } finally {
+    fs.rmSync(directorio, { recursive: true, force: true });
+  }
 });

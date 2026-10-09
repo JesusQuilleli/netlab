@@ -47,7 +47,7 @@ en local. **En la VPS es obligatorio `AUTH_ENABLED=true`.**
 ```bash
 npm run dev:api        # servidor con recarga
 npm run dev:web        # Vite en el 5173, con /api apuntando al 4310
-npm run test:all       # 697 tests de servidor + 76 de interfaz
+npm run test:all       # 840 tests de servidor + 80 de interfaz
 ```
 
 ---
@@ -147,7 +147,7 @@ cobre las consultas.
 src/
   core/        red, correo, formats, errores, config, redacción de secretos
   tools/       las siete herramientas (cada una, autocontenida)
-  server/      app.js (rutas), auth, usuarios, historial, auditoría, métricas
+  server/      app.js (rutas), auth, usuarios, historial, auditoría, métricas, backup
   formats/     json, md, html, txt, pdf
   docs/        generador del manual PDF
 web/           interfaz React (Vite), se compila a web/dist

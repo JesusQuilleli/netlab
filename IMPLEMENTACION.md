@@ -289,8 +289,19 @@ MAIL_b1_FROM=netlab@tu-dominio.com
 
 ## 8. Próximos Pasos Sugeridos
 
-- [ ] Interfaz web de administración de usuarios (página `/admin`)
-- [ ] Logs de auditoría (quién creó/revocó enlaces)
-- [ ] Métricas Prometheus (`/metrics`)
-- [ ] Backup automático de `data/netlab.db`
-- [ ] Rate-limit por usuario en `/api/run` (ya existe por IP)
+- [x] Interfaz web de administración de usuarios (página `/admin`)
+- [x] Logs de auditoría (quién creó/revocó enlaces)
+- [x] Métricas Prometheus (`/metrics`)
+- [x] Backup automático de `data/netlab.db`
+- [x] Rate-limit por usuario en `/api/run` (ya existe por IP)
+
+### Cómo se hizo el punto 8
+
+- **Backup**: `src/server/backup.js` snapshot `VACUUM INTO` a `data/backups/netlab-AAAAMMDD-HHMMSS.sqlite`
+  con retención (por defecto 7 copias, hora de 03:00 local, copia inmediata al arrancar).
+  Endpoints admin `GET/POST /api/backups`, evento de auditoría `backup_realizado`.
+- **Auditoría**: la API `GET /api/auditoria` ya filtra por tipo/usuario; el admin ahora la muestra en
+  `/admin` con filtro por tipo, junto con las copias de seguridad.
+- **Bug de revocación corregido**: `DELETE /api/compartir/:token` leía la variable `revogado` (nunca
+  definida) y respondía 500 siempre, y auditaba el tipo mal escrito `compartir_revogado`. Ahora usa
+  `TIPOS.COMPARTIR_REVOCADO` y responde 404 como corresponde cuando el enlace no existe.

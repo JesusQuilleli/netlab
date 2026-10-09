@@ -46,6 +46,7 @@ const TIPOS = {
   EJECUCION_COMPLETADA: 'ejecucion_completada',
   EJECUCION_FALLIDA: 'ejecucion_fallida',
   FORMATO_DESCARGADO: 'formato_descargado',
+  BACKUP_REALIZADO: 'backup_realizado',
 };
 
 class Auditoria {

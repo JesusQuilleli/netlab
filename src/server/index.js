@@ -30,7 +30,13 @@ async function arrancar(opciones = {}) {
   const host = opciones.host || config.leer('HOST') || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
   const puerto = Number(process.env.PORT ?? opciones.port ?? config.leer('PORT') ?? 4310);
 
-  const { app, auth, historial } = crearApp();
+  const { app, auth, historial, backup } = crearApp();
+
+  // Copia de seguridad diaria de `data/netlab.db`. El planificador falla sin
+  // tumbar el proceso: hace una copia al arrancar, avisa de los fallos y se
+  // refresca solo (el timer es `unref`, asi que no mantiene vivo el proceso).
+  backup.avisar = (e) => console.error(`  ERROR: backup no realizado: ${e.message}`);
+  backup.programar();
 
   // El aviso que mas importa: un servidor de diagnostico escuchando en todas las
   // interfaces sin autenticacion es un escaner de puertos abierto a Internet.
@@ -74,6 +80,7 @@ async function arrancar(opciones = {}) {
   const cerrar = () =>
     new Promise((cumplir) => {
       clearInterval(limpieza);
+      backup.detener();
       historial.cerrar();
       server.close(() => cumplir());
     });

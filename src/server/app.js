@@ -42,8 +42,9 @@ const { validar } = require('./validar');
 const { redactDeep } = require('../core/redact');
 const { Auth, leerCookie, NOMBRE_COOKIE } = require('./auth');
 const { Historial } = require('./historial');
-const { Auditoria, obtenerAuditoria } = require('./auditoria');
+const { Auditoria, obtenerAuditoria, TIPOS } = require('./auditoria');
 const { Metricas, obtenerMetricas } = require('./metricas');
+const { Backup } = require('./backup');
 const { addSummary } = require('../core/result');
 
 const DIR_SPA = path.join(__dirname, '..', '..', 'web', 'dist');
@@ -113,6 +114,7 @@ function crearApp(opciones = {}) {
   const historial = opciones.historial || new Historial();
   const auditoria = opciones.auditoria || obtenerAuditoria();
   const metricas = opciones.metricas || obtenerMetricas();
+  const backup = opciones.backup || new Backup();
 
   const maxEjecuciones = opciones.maxEjecuciones ?? 4;
   const maxPorMinuto = opciones.maxPorMinuto ?? 30;
@@ -429,6 +431,28 @@ function crearApp(opciones = {}) {
     res.json({ borrados });
   });
 
+  // ---------------------------------------------------------------- backups
+  app.get('/api/backups', exigeSesion, exigeAdmin, (_req, res) => {
+    res.json({
+      backups: backup.listar(),
+      retencion: backup.retencion,
+      hora: backup.hora,
+      directorio: backup.directorio
+    });
+  });
+
+  app.post('/api/backups', exigeSesion, exigeAdmin, exigeCsrf, (req, res) => {
+    // Copia a mano: la misma que hace el planificador, para no esperar a las
+    // tres de la manana si alguien va a tocar la base.
+    try {
+      const copia = backup.hacer();
+      auditoria.registrar({ tipo: TIPOS.BACKUP_REALIZADO, usuario: req.auth.usuario, ip: String(req.ip || req.socket?.remoteAddress || 'desconocida'), detalles: { nombre: copia.nombre, tamano: copia.tamano } });
+      res.status(201).json({ backup: copia, backups: backup.listar() });
+    } catch (e) {
+      responderError(res, e);
+    }
+  });
+
   // ----------------------------------------------------------- herramientas
   app.get('/api/herramientas', exigeSesion, (_req, res) => {
     res.json({ herramientas: listarHerramientas(), avisos: registro().avisos });
@@ -636,8 +660,8 @@ function crearApp(opciones = {}) {
   app.delete('/api/compartir/:shareToken', exigeSesion, exigeCsrf, (req, res) => {
     const owner = req.auth.usuario || 'local';
     const revocado = historial.revocarCompartido(req.params.shareToken, owner);
-    auditoria.registrar({ tipo: 'compartir_revogado', usuario: req.auth.usuario, ip: String(req.ip || req.socket?.remoteAddress || 'desconocida'), detalles: { shareToken: req.params.shareToken } });
-    res.status(revogado ? 200 : 404).json({ revocado });
+    auditoria.registrar({ tipo: TIPOS.COMPARTIR_REVOCADO, usuario: req.auth.usuario, ip: String(req.ip || req.socket?.remoteAddress || 'desconocida'), detalles: { shareToken: req.params.shareToken } });
+    res.status(revocado ? 200 : 404).json({ revocado });
   });
 
   // Public endpoint para ver informe compartido (sin autenticación)
@@ -794,7 +818,7 @@ app.get('/r/:shareToken', async (req, res) => {
     responderError(res, error);
   });
 
-  return { app, auth, historial, auditoria, metricas };
+  return { app, auth, historial, auditoria, metricas, backup };
 }
 
 module.exports = { crearApp, HTTP_POR_CODIGO, DIR_SPA };
