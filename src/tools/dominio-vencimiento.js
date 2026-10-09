@@ -22,6 +22,7 @@ const {
 const { NetlabError, CODES } = require('../core/errors');
 const { normalizarTimeout, normalizarDominio } = require('../core/dominio');
 const { consultarDominio } = require('../core/net/rdap');
+const dnsNet = require('../core/net/dns');
 
 const ID = 'dominio-vencimiento';
 const TITLE = 'Expiracion y Datos de Dominio';
@@ -90,6 +91,7 @@ function parsearWhois(raw, dominio) {
     dominio,
     fuente: 'whois',
     registrador: null,
+    registradorId: null,
     creacion: null,
     expiracion: null,
     actualizacion: null,
@@ -103,6 +105,7 @@ function parsearWhois(raw, dominio) {
 
   const patrones = {
     registrador: [/registrar:\s*(.+)/i, /sponsoring registrar:\s*(.+)/i, /registrar name:\s*(.+)/i],
+    registradorId: [/registrar iana id:\s*(.+)/i, /iana registrar id:\s*(.+)/i, /registrar id:\s*(.+)/i],
     creacion: [/creation date:\s*(.+)/i, /registered:\s*(.+)/i, /registration date:\s*(.+)/i, /created:\s*(.+)/i],
     expiracion: [/expir(?:y|ation) date:\s*(.+)/i, /registry expiry date:\s*(.+)/i, /expire:\s*(.+)/i, /expires:\s*(.+)/i],
     actualizacion: [/updated date:\s*(.+)/i, /last updated:\s*(.+)/i, /changed:\s*(.+)/i, /modified:\s*(.+)/i],
@@ -201,6 +204,7 @@ function combinarResultados(rdap, whois, dominio) {
     fuente: rdap?.disponible ? 'rdap' : (whois?.disponible ? 'whois' : 'none'),
     consultable: rdap?.consultable === true || whois?.disponible === true,
     registrador: rdap?.registrador || whois?.registrador || null,
+    registradorId: rdap?.registradorId || whois?.registradorId || null,
     creacion: rdap?.registro ? formatearFecha(rdap.registro) : (whois?.creacion ? formatearFecha(whois.creacion) : null),
     expiracion: rdap?.caducidad ? formatearFecha(rdap.caducidad) : (whois?.expiracion ? formatearFecha(whois.expiracion) : null),
     actualizacion: rdap?.ultimoCambio ? formatearFecha(rdap.ultimoCambio) : (whois?.actualizacion ? formatearFecha(whois.actualizacion) : null),
@@ -215,6 +219,186 @@ function combinarResultados(rdap, whois, dominio) {
 
   combinado.diasRestantes = diasHasta(combinado.expiracion);
   return combinado;
+}
+
+/* ------------------------------------------------------------------ *
+ * DNSSEC
+ * ------------------------------------------------------------------ */
+
+/** Nombre de los algoritmos de firma (RFC 4034 y posteriores). */
+const ALGORITMOS_DNSSEC = {
+  5: 'RSASHA1',
+  7: 'RSASHA1-NSEC3-SHA1',
+  8: 'RSASHA256',
+  10: 'RSASHA512',
+  13: 'ECDSAP256SHA256',
+  14: 'ECDSAP384SHA384',
+  15: 'ED25519',
+  16: 'ED448'
+};
+
+function nombrarAlgoritmo(algorithm) {
+  return ALGORITMOS_DNSSEC[algorithm] || `algoritmo ${algorithm}`;
+}
+
+/**
+ * Consulta DNSKEY y DS del dominio.
+ *
+ * No lanza: un fallo de red deja `{dnskey: null, ds: null}` y el informe dice
+ * que no se ha podido comprobar, que no es lo mismo que decir que no está
+ * firmado. La consulta entra por `ctx.dns` para que las pruebas no salgan a la
+ * red y el resto de consultas del módulo pueda reutilizar el mismo inyector.
+ */
+async function consultarDnssec(result, dominio, timeout, ctx) {
+  const dns = ctx?.dns || dnsNet;
+  try {
+    const [dnskey, ds] = await Promise.all([
+      dns.consultar(dominio, 'DNSKEY', { timeout }),
+      dns.consultar(dominio, 'DS', { timeout })
+    ]);
+    addLog(result, `DNSSEC: DNSKEY ${dnskey?.ok ? dnskey.valores.length + ' claves' : 'sin dato'} · DS ${ds?.ok ? ds.valores.length + ' registro(s)' : 'sin dato'}`, 'info');
+    return { dnskey, ds };
+  } catch (e) {
+    addLog(result, `DNSSEC: no se pudo consultar (${e.message})`, 'warn');
+    return { dnskey: null, ds: null };
+  }
+}
+
+/**
+ * Decide, en un solo sitio, cuál es la verdad de la cadena DNSSEC.
+ *
+ * Pintar la tabla y escribir los hallazgos con dos lógicas distintas es la
+ * forma más rápida de que un informe diga "verificada" arriba y "rota" abajo.
+ * `verificacion` es la única fuente de verdad para las dos cosas.
+ *
+ * @returns {{verificacion: string, tenidoDatos: boolean}}
+ */
+function verificarDnssec({ dominio, dnskey, ds }) {
+  const firmado = Boolean(dnskey?.ok && dnskey.valores.length);
+  const dsConDatos = Boolean(ds?.ok && ds.valores.length);
+
+  if (!firmado) {
+    if (dsConDatos) return { verificacion: 'ds-sin-claves', tenidoDatos: true };
+    if (dnskey?.ok) return { verificacion: 'sin-firma', tenidoDatos: true };
+    return { verificacion: 'sin-datos', tenidoDatos: false };
+  }
+
+  if (!dsConDatos) return { verificacion: 'firmado-sin-ds', tenidoDatos: true };
+
+  const tags = new Set(dnskey.valores.map((v) => v.keyTag));
+  const coinciden = ds.valores.filter((d) => tags.has(d.keyTag));
+  if (!coinciden.length) return { verificacion: 'ds-sin-clave', tenidoDatos: true };
+
+  const rotos = coinciden.filter((d) => {
+    const clave = dnskey.valores.find((v) => v.keyTag === d.keyTag);
+    const calculado = dnsNet.calcularDigestoDs(clave, dominio, d.digestType);
+    return calculado !== null && calculado !== d.digestHex;
+  });
+  if (rotos.length) return { verificacion: 'digest-roto', tenidoDatos: true };
+
+  return { verificacion: 'valido', tenidoDatos: true };
+}
+
+/** La fila de estado y el tono, para la tabla y para la tarjeta. */
+function estadoVisibleDnssec(v) {
+  switch (v.verificacion) {
+    case 'valido': return ['Firmado y verificado', 'ok'];
+    case 'sin-firma': return ['Sin DNSSEC', 'neutral'];
+    case 'firmado-sin-ds': return ['Firmado sin DS', 'warn'];
+    case 'ds-sin-claves': return ['DS sin claves publicadas', 'bad'];
+    case 'ds-sin-clave': return ['DS sin clave coincidente', 'bad'];
+    case 'digest-roto': return ['DS que no verifica', 'bad'];
+    default: return ['No se pudo comprobar', 'neutral'];
+  }
+}
+
+function pintarDnssec(result, args) {
+  const v = verificarDnssec(args);
+  const { dnskey, ds } = args;
+  const firmado = Boolean(dnskey?.ok && dnskey.valores.length);
+  const dsConDatos = Boolean(ds?.ok && ds.valores.length);
+  const [estado, tono] = estadoVisibleDnssec(v);
+  const algoritmos = firmado
+    ? [...new Set(dnskey.valores.map((k) => nombrarAlgoritmo(k.algorithm)))].join(', ')
+    : null;
+
+  addSection(result, {
+    id: 'dnssec',
+    title: 'DNSSEC',
+    description: 'Si el dominio está firmado, la zona padre publica un DS que apunta a su clave de firma. Que la cadena cierre significa que un validador no puede dejar que otra persona firme respuestas en su lugar.',
+    kind: K.TABLA,
+    columns: ['Dato', 'Valor'],
+    rows: [
+      ['Estado', { valor: estado, tone: tono }],
+      ['Claves DNSKEY', firmado ? `${dnskey.valores.length} clave(s) — ${algoritmos}` : 'Sin firmar'],
+      ['KSK publicadas', firmado ? dnskey.valores.filter((k) => (k.flags & 0x0001) !== 0).length : '—'],
+      ['DS en la zona padre', dsConDatos ? ds.valores.map((d) => `keyTag ${d.keyTag}`).join(', ') : 'Ninguno'],
+      ['Verificación del DS', v.verificacion === 'valido' ? 'Coincide con la clave publicada' : v.verificacion === 'digest-roto' ? 'No coincide con la clave publicada' : v.verificacion === 'sin-datos' ? 'No consultable' : '—']
+    ]
+  });
+}
+
+function revisarDnssec(result, args) {
+  const v = verificarDnssec(args);
+  const { dominio } = args;
+
+  switch (v.verificacion) {
+    case 'valido':
+      addFinding(result, {
+        severity: 'ok',
+        title: 'DNSSEC vigente y verificado',
+        detail: `El DS de la zona padre coincide con el digest recalculado sobre la clave publicada de ${dominio}. La cadena de confianza cierra.`,
+        recommendation: 'Nada que corregir. Al rotar claves, publica el nuevo DS antes de retirar la clave antigua.'
+      });
+      break;
+    case 'sin-firma':
+      addFinding(result, {
+        severity: 'info',
+        title: 'El dominio no está firmado con DNSSEC',
+        detail: 'No hay registros DNSKEY. Sin firma no hay cadena que validar: cada respuesta viaja sin garantía de que la enviara la zona real.',
+        recommendation: 'Firmar es opcional y siempre exige publicar el DS en la zona padre. Si no necesitas DNSSEC, no es un fallo.'
+      });
+      break;
+    case 'firmado-sin-ds':
+      addFinding(result, {
+        severity: 'warn',
+        title: 'El dominio está firmado pero la zona padre no publica su DS',
+        detail: `${dominio} publica DNSKEY pero no hay ningún registro DS en la zona de arriba. Un validador estricto no puede enlazar con la raíz de confianza.`,
+        recommendation: 'Publica el DS con el keyTag y el algoritmo de la KSK en el registrador. Es el paso que conecta la zona con la de arriba.'
+      });
+      break;
+    case 'ds-sin-claves':
+      addFinding(result, {
+        severity: 'error',
+        title: 'La zona padre tiene DS pero el dominio no publica las claves',
+        detail: `Hay ${args.ds.valores.length} registro(s) DS apuntando a claves que ${dominio} no publica. Un validador busca la clave, no la encuentra y la resolución acaba en SERVFAIL.`,
+        recommendation: 'Publica la DNSKEY correspondiente o retira el DS de la zona padre si la clave ya no debe existir.'
+      });
+      break;
+    case 'ds-sin-clave':
+      addFinding(result, {
+        severity: 'error',
+        title: 'El DS no corresponde con ninguna clave publicada',
+        detail: `El DS anuncia ${args.ds.valores.map((d) => `keyTag ${d.keyTag}`).join(', ')} pero ${dominio} publica ${args.dnskey.valores.map((k) => `keyTag ${k.keyTag}`).join(', ')}.`,
+        recommendation: 'Actualiza el DS a la KSK actual, o publica en la zona la clave que el DS promete. Ambos han de convivir durante la transición.'
+      });
+      break;
+    case 'digest-roto':
+      addFinding(result, {
+        severity: 'error',
+        title: 'El DS no coincide con el contenido de la clave',
+        detail: 'El keyTag encaja pero el digest del DS no se corresponde con el recalculado sobre la DNSKEY publicada. El validador rechaza la cadena y el dominio puede fallar al resolver.',
+        recommendation: 'Vuelve a generar el DS a partir de la KSK actual. Suele pasar al dejar un DS viejo o de otra clave que comparte keyTag.'
+      });
+      break;
+    default:
+      addFinding(result, {
+        severity: 'info',
+        title: 'No se pudo comprobar el estado DNSSEC',
+        detail: 'Las consultas de DNSKEY y DS no devolvieron datos utilizables.',
+        recommendation: 'No significa que al dominio le falte algo. Revisa la conectividad y repite.'
+      });
+  }
 }
 
 async function ejecutar(params = {}, ctx = {}) {
@@ -276,7 +460,7 @@ async function ejecutar(params = {}, ctx = {}) {
     ['Dominio', datos.dominio],
     ['Fuente principal', datos.fuente.toUpperCase()],
     ['Consultable', datos.consultable ? 'Si' : 'No'],
-    ['Registrador', datos.registrador || 'desconocido'],
+    ['Registrador', datos.registrador ? (datos.registradorId ? `${datos.registrador} (IANA ${datos.registradorId})` : datos.registrador) : 'desconocido'],
     ['Fecha de creacion', datos.creacion || 'desconocida'],
     ['Fecha de expiracion', datos.expiracion || 'desconocida'],
     ['Ultima actualizacion', datos.actualizacion || 'desconocida'],
@@ -349,6 +533,13 @@ addSection(result, {
       : [{ value: 'El registro no publico nameservers para este dominio.' }]
   });
 
+  // DNSSEC: la firma es un dato del dominio, no de la caducidad, pero importa
+  // al renovar: un dominio con DNSSEC roto deja de resolver semanas antes de
+  // que caduque. Por eso cierra el informe de este módulo.
+  const dnssec = await consultarDnssec(result, dominio, timeout, ctx);
+  pintarDnssec(result, { dominio, ...dnssec });
+  revisarDnssec(result, { dominio, ...dnssec });
+
   // Si RDAP no cubrio el TLD y WHOIS si, se vuelca la respuesta cruda: es la
   // unica forma de ver el dato completo (y de diagnosticar un parseo fallido).
   if (!rdapData?.disponible && whoisData?.disponible && whoisData.raw) {
@@ -394,12 +585,16 @@ addSection(result, {
 module.exports = {
   id: ID,
   titulo: TITLE,
-  descripcion: 'Consulta la fecha de expiracion, registrador, estados y nameservers de un dominio usando RDAP (principal) y WHOIS (fallback). Detecta dominios expirados, por expirar y muestra dias restantes.',
+  descripcion: 'Consulta la fecha de expiracion, registrador, estados y nameservers de un dominio usando RDAP (principal) y WHOIS (fallback). Detecta dominios expirados, por expirar y muestra dias restantes, ademas del estado DNSSEC (DS/DNSKEY).',
   icon: '📅',
   sinRed: false,
   campos: CAMPOS,
   ejecutar,
   // Exportados para las pruebas.
   parsearWhois,
-  combinarResultados
+  combinarResultados,
+  verificarDnssec,
+  pintarDnssec,
+  revisarDnssec,
+  consultarDnssec
 };
