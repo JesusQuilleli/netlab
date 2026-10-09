@@ -4,27 +4,31 @@
  * DE DONDE SALE. legacy/Validate IP/info-ip.js eran tres lineas sueltas con un
  * conversor de IPv4 a entero, sin programa que las llamara. No habia nada que
  * migrar: esta herramienta es nueva, hecha sobre las piezas que si existen
- * (`core/net/rdap`, `core/net/dnsbl`, `core/net/ptr`).
+ * (`core/net/rdap`, `core/net/dnsbl`, `core/net/ptr`, `core/net/asn`).
  *
  * QUE PREUNTA, Y EN QUE ORDEN:
  *
  * 1. RDAP: quien tiene el bloque asignado y a quien se escribe para quejarse.
- * 2. PTR: que nombre apunta a la IP. En una IP de correo es la mitad del
+ * 2. ASN: que sistema autonomo anuncia la IP por BGP y desde que pais. No es lo
+ *    mismo que el registro: el bloque lo registra Google, pero puede que quien
+ *    lo anuncie sea un cliente alojado en Google, o al reves. La fuente es Team
+ *    Cymru, por DNS, gratis y sin clave.
+ * 3. PTR: que nombre apunta a la IP. En una IP de correo es la mitad del
  *    diagnostico de suplantacion, y hay quien bloquea solo por no tener PTR.
- * 3. DNSBL: si la IP esta en listas negras de correo.
- * 4. BCL: si la IP figura como controlador de botnet. Va aparte de las de
+ * 4. DNSBL: si la IP esta en listas negras de correo.
+ * 5. BCL: si la IP figura como controlador de botnet. Va aparte de las de
  *    correo porque no es lo mismo: una IP en BCL es una IP desde la que se manda
  *    malware a otros equipos, y mezclarla con el recuento de reputacion de
  *    correo hace que el informe entero se lea como "una IP que manda mucho
  *    correo", que es justo el malentendido que cuesta caro.
- * 5. Blocklists via DNS Query de Spamhaus, si hay clave: si la IP SIGUE listada ahora mismo.
+ * 6. Blocklists via DNS Query de Spamhaus, si hay clave: si la IP SIGUE listada ahora mismo.
  *
  * LAS CUATRO COSAS QUE ESTA HECHO DISTINTO:
  *
  * 1. UNA IP, no una lista. `ip-abuse` acepta varias porque el dato por IP es
- *    barato. Aqui cada IP son tres consultas mas: registro, PTR y nueve zonas.
- *    Con cinco IPs son 50 preguntas y un informe que nadie lee entero. El
- *    informe de una IP ya tiene bastante.
+ *    barato. Aqui cada IP son cuatro consultas mas: registro, sistema autonomo,
+ *    PTR y las listas. Con cinco IPs son 50 preguntas y un informe que nadie
+ *    lee entero. El informe de una IP ya tiene bastante.
  *
  * 2. Cuenta OPERADORES DISTINTOS, no zonas. Las nueve zonas cortas son de seis
  *    operadores, y cuatro de ellas son de Spamhaus. Una IP listada en ZEN, XBL,
@@ -54,6 +58,7 @@
 const ipaddr = require('../core/net/ipaddr');
 const rdap = require('../core/net/rdap');
 const dnsbl = require('../core/net/dnsbl');
+const asn = require('../core/net/asn');
 const spamhaus = require('../core/net/spamhaus');
 const ptr = require('../core/net/ptr');
 const config = require('../core/config');
@@ -73,7 +78,7 @@ const CAMPOS = [
     type: 'text',
     required: true,
     placeholder: '203.0.113.10',
-    help: 'Una sola IP. Admite IPv4 e IPv6. Cada IP son tres consultas (registro, nombre inverso y listas negras), asi que se auditan de una en una.'
+    help: 'Una sola IP. Admite IPv4 e IPv6. Cada IP son cuatro consultas (registro, sistema autonomo, nombre inverso y listas negras), asi que se auditan de una en una.'
   },
   {
     name: 'dnsbl',
@@ -83,7 +88,7 @@ const CAMPOS = [
     default: true,
     help:
       `${dnsbl.LISTAS_CORTA.length} zonas gratuitas, y una de ellas es la de bots de Spamhaus. Apagado solo se ` +
-      'consulta el registro y el nombre inverso, que van al instante.'
+      'consulta el registro, el sistema autonomo y el nombre inverso, que van al instante.'
   },
   {
     name: 'listas',
@@ -139,9 +144,10 @@ const RE_PRIVACIDAD = /\b(privacy|privacidad|redacted|redact|withheld|withhold|w
  * Punto de entrada de la herramienta.
  *
  * @param {object} params Entrada del formulario.
- * @param {object} [ctx] Contexto. `ctx.rdap`, `ctx.dnsbl`, `ctx.spamhaus` y
- *   `ctx.ptr` permiten inyectar dobles; `ctx.fetchImpl` se pasa al cliente HTTP
- *   de RDAP y al de Spamhaus; `ctx.claveSpamhaus` sustituye a la del entorno.
+ * @param {object} [ctx] Contexto. `ctx.rdap`, `ctx.asn`, `ctx.dnsbl`,
+ *   `ctx.spamhaus` y `ctx.ptr` permiten inyectar dobles; `ctx.fetchImpl` se pasa
+ *   al cliente HTTP de RDAP y al de Spamhaus; `ctx.claveSpamhaus` sustituye a la
+ *   del entorno.
  * @returns {Promise<object>} Result completo, listo para renderizar.
  */
 async function ejecutar(params = {}, ctx = {}) {
@@ -165,11 +171,13 @@ async function ejecutar(params = {}, ctx = {}) {
     log?.info?.(`ip-audit: ${ip} bits=${bits} dnsbl=${params.dnsbl !== false}`);
 
     const registro = await consultarRegistro(result, ip, ctx, log);
+    const sistema = await consultarAsn(result, ip, params, ctx, log);
     const inverso = await consultarInverso(result, ip, ctx);
     const listas = await consultarListas(result, ip, params, ctx, log);
     const consultaSpamhaus = await consultarSpamhaus(result, ip, params, ctx, log);
 
     revisarRegistro(result, registro, ip);
+    revisarAsn(result, sistema, registro);
     revisarInverso(result, inverso);
     revisarListas(result, listas);
     revisarSpamhaus(result, consultaSpamhaus);
@@ -177,6 +185,13 @@ async function ejecutar(params = {}, ctx = {}) {
     addSummary(result, 'Direccion', ip, 'neutral');
     addSummary(result, 'Familia', `IPv${bits === 32 ? 4 : 6}`, 'neutral');
     addSummary(result, 'Titular del bloque', registro.disponible ? registro.nombre || registro.titular || 'Sin dato' : 'Sin dato', 'neutral');
+    addSummary(result, 'Pais', registro.disponible ? registro.pais || sistema?.pais || 'Sin dato' : sistema?.pais || 'Sin dato', 'neutral');
+    addSummary(
+      result,
+      'Sistema autonomo',
+      textoAsn(sistema),
+      tonoAsn(sistema)
+    );
     addSummary(result, 'Nombre inverso', inverso.configurado ? inverso.nombres[0] : 'Sin PTR', inverso.configurado ? 'ok' : 'warn');
     addSummary(
       result,
@@ -248,6 +263,28 @@ async function consultarRegistro(result, ip, ctx, log) {
     addLog(result, { level: 'warn', channel: 'rdap', message: `No se pudo consultar el registro: ${error.message}` });
     log?.warn?.(`ip-audit rdap fallo: ${error.message}`);
     return { ip, disponible: false, motivo: error.message, error: true };
+  }
+}
+
+/**
+ * Sistema autonomo. Un fallo aqui no tumba el informe.
+ *
+ * Esta consulta siempre se hace: es una o dos preguntas DNS, baratas, y el dato
+ * responde a "de quien ES esta IP" mejor que el propio registro. No hay casilla
+ * para apagarla a proposito, como si la hay para las listas, porque no tiene
+ * coste ni falso positivo del que haya que protegerse.
+ */
+async function consultarAsn(result, ip, params, ctx, log) {
+  const consultar = ctx.asn?.consultar || asn.consultar;
+  try {
+    const r = await consultar(ip, { dns: ctx.dns || undefined, timeout: acotar(params.timeout, 1000, 60000, 10000) });
+    addLog(result, { level: 'info', channel: 'asn', message: `ASN ${r.estado}: ${r.asn ? `AS${r.asn}` : 'sin dato'}` });
+    log?.info?.(`ip-audit asn ${r.estado}: ${r.asn ? `AS${r.asn}` : ''}`);
+    return r;
+  } catch (error) {
+    addLog(result, { level: 'warn', channel: 'asn', message: `No se pudo consultar el sistema autonomo: ${error.message}` });
+    log?.warn?.(`ip-audit asn fallo: ${error.message}`);
+    return { ip, estado: asn.ESTADOS.SIN_DATOS, error: error.message };
   }
 }
 
@@ -407,6 +444,121 @@ function revisarRegistro(result, registro, ip) {
       value: registro.enlace
     });
   }
+}
+
+/**
+ * El sistema autonomo y lo poco que hay que decir sobre el.
+ *
+ * Lo importante es que "no anunciada" y "sin datos" no suenen igual en el
+ * informe: la primera es una respuesta normal de Team Cymru (rangos reservados,
+ * TEST-NET, direcciones internas) y la segunda es un hueco de verdad. Por eso la
+ * seccion de "sin datos" lleva el motivo, y se genera un hallazgo.
+ *
+ * El pais cruzado va sin veredicto: que el registro diga un pais y el ASN otro
+ * es habitual (un bloque registrado en ARIN anunciado por un operador europeo),
+ * asi que la tarea no puede ser dar por buena o por mala la diferencia, solo
+ * apuntarla.
+ *
+ * @param {object} result
+ * @param {object|null} sistema Resultado de `asn.consultar`.
+ * @param {object} registro Resultado de `rdap.consultar`.
+ */
+function revisarAsn(result, sistema, registro) {
+  if (!sistema) return;
+
+  addSection(result, {
+    title: 'Sistema autonomo (ASN)',
+    kind: K.PARES,
+    description: itemsAsnNota(sistema),
+    items: itemsAsn(sistema)
+  });
+
+  if (sistema.estado === asn.ESTADOS.SIN_DATOS) {
+    addFinding(result, {
+      severity: SEVERIDADES.WARN,
+      title: 'No se pudo averiguar que sistema autonomo anuncia la IP',
+      detail:
+        sistema.error ||
+        'La consulta a Team Cymru no devolvio nada utilizable. Sin este dato solo se sabe quien registro el bloque, no quien lo anuncia.',
+      recommendation:
+        'Reintenta. Si se repite, consulta el ASN en una pagina de whois de BGP (bgp.he.net o ipinfo.io) para no dejar el informe con el hueco.'
+    });
+    return;
+  }
+
+  if (sistema.estado === asn.ESTADOS.NO_ANUNCIADA) {
+    return;
+  }
+
+  for (const aviso of sistema.avisos || []) {
+    addLog(result, { level: 'warn', channel: 'asn', message: aviso });
+  }
+
+  if (registro?.pais && sistema.pais && registro.pais !== sistema.pais) {
+    addFinding(result, {
+      severity: SEVERIDADES.INFO,
+      title: 'El pais del registro no coincide con el del sistema autonomo',
+      detail: `El bloque se registro en ${registro.pais} y el sistema autonomo que lo anuncia dice ${sistema.pais}.`,
+      recommendation: 'No es necesariamente un problema: un rango puede registrarse en un registro regional y anunciarse desde otro pais.'
+    });
+  }
+}
+
+/** La nota de la seccion del ASN, cuando la merece. */
+function itemsAsnNota(sistema) {
+  if (sistema.estado !== asn.ESTADOS.ENCONTRADO) return null;
+  if (!sistema.avisos || !sistema.avisos.length) return null;
+  return `${sistema.avisos.join(' ')}`;
+}
+
+/** Los pares de la seccion del ASN, segun el estado. */
+function itemsAsn(sistema) {
+  if (sistema.estado === asn.ESTADOS.SIN_DATOS) {
+    return [
+      ['Estado', 'Sin datos'],
+      ['Motivo', sistema.error || 'La consulta no devolvio nada utilizable.'],
+      ['Que significa', 'No se sabe que sistema autonomo anuncia la IP. No es lo mismo que "no anunciada".']
+    ];
+  }
+
+  if (sistema.estado === asn.ESTADOS.NO_ANUNCIADA) {
+    return [
+      ['Estado', 'No anunciada'],
+      ['Que significa', 'Ningun sistema autonomo anuncia esta IP. Es la respuesta normal para rangos reservados, direcciones internas y redes de prueba.']
+    ];
+  }
+
+  const pares = [
+    ['Operador', sistema.nombre || `AS${sistema.asn}`],
+    ['Numero', `AS${sistema.asn}`],
+    ['Prefijo anunciado', sistema.prefijo || 'Sin dato'],
+    ['Pais', sistema.pais || 'Sin dato'],
+    ['Registro del ASN', sistema.registro || 'Sin dato'],
+    ['Asignado', sistema.asignado || 'Sin dato']
+  ];
+
+  if (!sistema.nombre) {
+    pares.unshift(['Nombre', 'Sin dato — la zona de registro del ASN no respondio']);
+  }
+
+  return pares;
+}
+
+/** Que poner en la tarjeta del sistema autonomo. */
+function textoAsn(sistema) {
+  if (!sistema) return 'Sin consultar';
+  if (sistema.estado === asn.ESTADOS.ENCONTRADO) {
+    return sistema.nombre ? `AS${sistema.asn} — ${sistema.nombre}` : `AS${sistema.asn}`;
+  }
+  if (sistema.estado === asn.ESTADOS.NO_ANUNCIADA) return 'No anunciada';
+  return 'Sin datos';
+}
+
+/** El tono de la tarjeta del sistema autonomo. */
+function tonoAsn(sistema) {
+  if (!sistema) return 'neutral';
+  if (sistema.estado === asn.ESTADOS.SIN_DATOS) return 'warn';
+  return 'neutral';
 }
 
 /** El registro no siempre viene bien: hay que decir cuando falta algo de verdad. */

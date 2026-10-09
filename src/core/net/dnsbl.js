@@ -44,7 +44,7 @@ const SIN_DATOS = 'sin-datos';
 /**
  * Las listas que se consultan por defecto.
  *
- * Son siete de uso general y gratuitas. La eleccion es deliberadamente corta:
+ * Son diez de uso general y gratuitas. La eleccion es deliberadamente corta:
  * consultar cuarenta zonas cuesta tiempo y, sobre todo, cada lista que se apaga
  * sin avisar mete ruido en el informe. Si el usuario quiere mas, pide el
  * conjunto ampliado.
@@ -139,6 +139,26 @@ const LISTAS_CORTA = [
     ipv6: false,
     quitarUltimoOcteto: false,
     nota: 'Lista mantenida a mano. Solo contiene entradas confirmadas.'
+  },
+  {
+    clave: 'dronebl',
+    nombre: 'DroneBL',
+    proveedor: 'DroneBL',
+    categoria: 'correo',
+    zona: 'dnsbl.dronebl.org',
+    ipv6: false,
+    quitarUltimoOcteto: false,
+    nota: 'Equipos comprometidos: bots, puertos abiertos en abuso y rutas de retransmision. Se usa mucho en filtrado de correo.'
+  },
+  {
+    clave: 'spamrbl',
+    nombre: 'SpamRBL (IMP)',
+    proveedor: 'IMP',
+    categoria: 'correo',
+    zona: 'spamrbl.imp.ch',
+    ipv6: false,
+    quitarUltimoOcteto: false,
+    nota: 'Del Instituto de Politica de Internet (IMP). Lista de spam y hosts comprometidos, mantenida a mano.'
   }
 ];
 /**
@@ -187,6 +207,36 @@ const LISTAS_AMPLIA = [
     ipv6: false,
     quitarUltimoOcteto: false,
     nota: 'Nivel 3: agresivo. Un solo aviso puede meter una IP entera.'
+  },
+  {
+    clave: 'gbudb',
+    nombre: 'GBUdb',
+    proveedor: 'GBUdb',
+    categoria: 'correo',
+    zona: 'truncate.gbudb.net',
+    ipv6: false,
+    quitarUltimoOcteto: false,
+    nota: 'Lista de comportamiento de origen (spam, malware, backscatter). Incluye rangos para penalizar.'
+  },
+  {
+    clave: 'fabel',
+    nombre: 'FABEL (spamsources)',
+    proveedor: 'FABEL',
+    categoria: 'correo',
+    zona: 'spamsources.fabel.dk',
+    ipv6: false,
+    quitarUltimoOcteto: false,
+    nota: 'Lista danesa de fuentes de spam, mantenida a mano.'
+  },
+  {
+    clave: 'justspam',
+    nombre: 'JustSpam',
+    proveedor: 'JustSpam',
+    categoria: 'correo',
+    zona: 'dnsbl.justspam.org',
+    ipv6: false,
+    quitarUltimoOcteto: false,
+    nota: 'Lista con retirada por si sola (los listados caducan solos). Menor precision.'
   }
 ];
 

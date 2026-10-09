@@ -37,6 +37,26 @@ const PTR_OK = { nombres: ['host.ejemplo.net'], configurado: true, error: null }
 const PTR_NULO = { nombres: [], configurado: false, error: null };
 
 /**
+ * ASN de mentira, completo.
+ *
+ * El pais coincide con el de RDAP_OK a proposito: si no, todos los informes de
+ * los tests de abajo llevarian un hallazgo extra de "paises no coinciden" que
+ * no tiene que ver con lo que estan midiendo.
+ */
+const ASN_OK = {
+  ip: '203.0.113.10',
+  estado: require('../src/core/net/asn').ESTADOS.ENCONTRADO,
+  asns: ['15169'],
+  asn: '15169',
+  prefijo: '8.8.8.0/24',
+  pais: 'US',
+  registro: 'arin',
+  asignado: '2023-12-28',
+  nombre: 'GOOGLE - Google LLC, US',
+  avisos: []
+};
+
+/**
  * DNSBL de mentira.
  *
  * NO reimplementa el modulo: llama al de verdad y solo sustituye la capa DNS.
@@ -106,12 +126,13 @@ function dnsblDoble(porOperador = {}, spambausSinRegistro = false) {
  */
 function ejecutar(
   params,
-  { rdap = RDAP_OK, ptr = PTR_OK, dnsbl: db = dnsblDoble(), spamhaus: sh, claveSpamhaus = '' } = {}
+  { rdap = RDAP_OK, ptr = PTR_OK, dnsbl: db = dnsblDoble(), asn: as, spamhaus: sh, claveSpamhaus = '' } = {}
 ) {
   return herramienta.ejecutar(params, {
     rdap: { consultar: async () => rdap },
     ptr: { resolver: async () => ptr },
     dnsbl: db,
+    asn: as || { consultar: async () => ASN_OK },
     spamhaus: sh,
     claveSpamhaus
   });
@@ -234,6 +255,93 @@ test('la tarjeta de resumen dice la familia y la IP', async () => {
 test('una IPv6 se reconoce como IPv6 en el resumen', async () => {
   const r = await ejecutar({ ip: '2001:db8::1' });
   assert.equal(r.summary.find((s) => s.label === 'Familia').value, 'IPv6');
+});
+
+// ------------------------------------------------------------------ sistema autonomo
+
+test('el sistema autonomo sale en su seccion, con el operador por delante', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' });
+  const seccion = r.sections.find((s) => s.title.includes('Sistema autonomo'));
+
+  assert.ok(seccion, 'la consulta siempre se hace: no hay casilla que la apague');
+  const par = (etiqueta) => seccion.items.find(([k]) => k === etiqueta)?.[1];
+  assert.equal(par('Operador'), 'GOOGLE - Google LLC, US');
+  assert.equal(par('Numero'), 'AS15169');
+  assert.equal(par('Prefijo anunciado'), '8.8.8.0/24');
+  assert.equal(par('Pais'), 'US');
+});
+
+test('la tarjeta de resumen lleva el pais y el sistema autonomo', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' });
+  const tarjeta = (etiqueta) => r.summary.find((s) => s.label === etiqueta)?.value;
+
+  // El pais del bloque gana al del ASN, y solo se cae al segundo si el registro
+  // no trae pais.
+  assert.equal(tarjeta('Pais'), 'US');
+  assert.equal(tarjeta('Sistema autonomo'), 'AS15169 — GOOGLE - Google LLC, US');
+});
+
+test('si el registro no tiene pais, el del ASN cubre la tarjeta', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, { rdap: { ...RDAP_OK, pais: null } });
+  assert.equal(r.summary.find((s) => s.label === 'Pais').value, 'US');
+});
+
+test('un ASN sin datos avisa, y no se lee como "no anunciada"', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, {
+    asn: { consultar: async () => ({ ip: '203.0.113.10', estado: require('../src/core/net/asn').ESTADOS.SIN_DATOS, error: 'ETIMEDOUT' }) }
+  });
+
+  const hueco = r.findings.find((f) => f.title.includes('No se pudo averiguar que sistema autonomo'));
+  assert.ok(hueco, 'un hueco de verdad se avisa');
+  assert.equal(hueco.severity, 'warn');
+  assert.equal(r.summary.find((s) => s.label === 'Sistema autonomo').value, 'Sin datos');
+  assert.equal(r.summary.find((s) => s.label === 'Sistema autonomo').tone, 'warn');
+});
+
+test('si el modulo de ASN lanza, el informe no se cae', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, {
+    asn: { consultar: async () => { throw new Error('red caida'); } }
+  });
+
+  assert.notEqual(r.status, 'error', 'las fuentes son independientes');
+  const seccion = r.sections.find((s) => s.title.includes('Sistema autonomo'));
+  assert.ok(seccion);
+  assert.match(JSON.stringify(seccion.items), /Sin datos/);
+  assert.ok(r.findings.some((f) => f.title.includes('sistema autonomo')));
+});
+
+test('una IP no anunciada se muestra como tal, sin hallazgo', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, {
+    asn: { consultar: async () => ({ ip: '203.0.113.10', estado: require('../src/core/net/asn').ESTADOS.NO_ANUNCIADA }) }
+  });
+
+  // "No anunciada" es la respuesta normal para rangos reservados y de prueba: no
+  // huele a fallo y el informe no debe decir que lo sea.
+  assert.equal(r.summary.find((s) => s.label === 'Sistema autonomo').value, 'No anunciada');
+  assert.ok(!r.findings.some((f) => f.title.includes('sistema autonomo')), 'no hay hallazgo que contar');
+});
+
+test('los paises que no coinciden se apuntan, sin inventar un veredicto', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, {
+    asn: { consultar: async () => ({ ...ASN_OK, pais: 'ES' }) }
+  });
+
+  const aviso = r.findings.find((f) => f.title.includes('no coincide'));
+  assert.ok(aviso, 'la diferencia sale, porque se ve');
+  assert.equal(aviso.severity, 'info');
+  assert.match(aviso.recommendation, /no es necesariamente un problema/i);
+});
+
+test('sin nombre de ASN, la seccion lo dice y no tumba el numero', async () => {
+  const r = await ejecutar({ ip: '203.0.113.10' }, {
+    asn: { consultar: async () => ({ ...ASN_OK, nombre: null, avisos: ['La zona de registro no contesto.'] }) }
+  });
+
+  const seccion = r.sections.find((s) => s.title.includes('Sistema autonomo'));
+  const par = (etiqueta) => seccion.items.find(([k]) => k === etiqueta)?.[1];
+  assert.equal(par('Numero'), 'AS15169', 'el numero no depende del nombre');
+  assert.match(par('Nombre'), /Sin dato/);
+  assert.equal(r.summary.find((s) => s.label === 'Sistema autonomo').value, 'AS15169');
 });
 
 // ------------------------------------------------------------------ fallos parciales
