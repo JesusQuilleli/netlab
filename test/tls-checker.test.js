@@ -25,11 +25,12 @@ const tlsNet = require('../src/core/net/tls');
 const CERT = path.join(__dirname, 'fixtures', 'tls', 'selfsigned.crt.pem');
 const KEY = path.join(__dirname, 'fixtures', 'tls', 'selfsigned.key.pem');
 
-function levantarServidor() {
+function levantarServidor(opciones = {}) {
   const servidor = tls.createServer(
     {
       cert: fs.readFileSync(CERT),
-      key: fs.readFileSync(KEY)
+      key: fs.readFileSync(KEY),
+      ...opciones
     },
     (socket) => {
       // El servidor TLS no habla HTTP aquí: solo hace falta el handshake.
@@ -214,6 +215,29 @@ test('inspeccionar lee un certificado real (autofirmado, con clave y SAN)', asyn
       assert.ok(certificado.nombresAlternativos.some((n) => /DNS:localhost/.test(n)));
       assert.ok(Array.isArray(certificado.cadena));
       assert.ok(certificado.huella256);
+    } finally {
+      socket.destroy();
+    }
+  } finally {
+    servidor.close();
+  }
+});
+
+test('conectar negocia ALPN y lo deja en la ficha del certificado', async () => {
+  // Sin ALPNProtocols en el servidor, `alpnProtocol` es `false` (no `null`), y
+  // el cliente no puede saber si el servidor quería HTTP/2. Con ambos lados
+  // configurados sí: es lo que usa web-checker para detectar h2.
+  const { servidor, puerto } = await levantarServidor({ ALPNProtocols: ['h2', 'http/1.1'] });
+  try {
+    const { socket, certificado, alpn } = await tlsNet.conectar({
+      host: '127.0.0.1',
+      port: puerto,
+      timeout: 5000,
+      alpnProtocols: ['h2', 'http/1.1']
+    });
+    try {
+      assert.equal(alpn, 'h2');
+      assert.equal(certificado.alpn, 'h2');
     } finally {
       socket.destroy();
     }

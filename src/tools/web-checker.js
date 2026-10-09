@@ -195,10 +195,18 @@ const url = web.normalizarUrl(bruto);
     const tls = url.protocol === 'https:' ? await consultarTls(result, url.hostname, opciones, ctx) : null;
     const registro = await consultarRegistro(result, url.hostname, opciones, ctx);
 
+    // Las cabeceras solo existen si hubo respuesta. Sin respuesta no se analiza
+    // nada: inventar "falta HSTS" sobre un sitio que no contestó es ruido.
+    const cabeceras = !sondeo.respuesta?.error
+      ? analizarCabeceras(sondeo.respuesta?.cabeceras, { https: url.protocol === 'https:' })
+      : null;
+    const protocolo = determinarProtocolo(tls, dns.https);
+    const conexion = await calificarConexion(tls, cabeceras, url, opciones, ctx);
+
     if (opciones.compararResolvers) await compararResolvers(result, url.hostname, opciones, ctx);
 
-    pintarDiagnostico(result, { url, r: sondeo.respuesta, dns, tls, registro });
-    revisar(result, { url, r: sondeo.respuesta, dns, tls, registro });
+    pintarDiagnostico(result, { url, r: sondeo.respuesta, dns, tls, registro, cabeceras, protocolo, conexion });
+    revisar(result, { url, r: sondeo.respuesta, dns, tls, registro, cabeceras, protocolo, conexion });
 
     return finalize(result, inicio);
   } catch (error) {
@@ -300,22 +308,27 @@ async function consultarDns(result, host, opciones, ctx) {
   // acabaría diciendo "no resuelve a ninguna dirección" de algo que sí responde.
   if (esIpLiteral(host)) {
     addLog(result, { level: 'info', channel: 'dns', message: `${host} es una dirección, no hay nombre que resolver` });
-    return { literal: true, resuelve: true, direcciones: [host], a: null, aaaa: null };
+    return { literal: true, resuelve: true, direcciones: [host], a: null, aaaa: null, https: null };
   }
 
   const dns = ctx.dns || dnsNet;
   const registros = await dns.consultarLote(
     [
       { nombre: host, tipo: 'A' },
-      { nombre: host, tipo: 'AAAA' }
+      { nombre: host, tipo: 'AAAA' },
+      // El registro HTTPS dice qué versiones de HTTP anuncia el servidor (h3,
+      // h2). Sin él, HTTP/3 no se puede ni sospechar: se negocia en otro
+      // transporte y no aparece en el handshake TLS clásico.
+      { nombre: host, tipo: 'HTTPS' }
     ],
-    { concurrencia: 2, dns: { timeout: opciones.timeoutMs, reintentos: 1 } }
+    { concurrencia: 3, dns: { timeout: opciones.timeoutMs, reintentos: 1 } }
   );
 
   const salida = {
     literal: false,
     a: registros.find((r) => r.tipo === 'A') || null,
-    aaaa: registros.find((r) => r.tipo === 'AAAA') || null
+    aaaa: registros.find((r) => r.tipo === 'AAAA') || null,
+    https: registros.find((r) => r.tipo === 'HTTPS') || null
   };
   salida.direcciones = [...(salida.a?.valores || []), ...(salida.aaaa?.valores || [])];
   salida.resuelve = salida.direcciones.length > 0;
@@ -351,26 +364,30 @@ async function consultarTls(result, host, opciones, ctx) {
     }
   };
 
+  const ALPN = ['h2', 'http/1.1'];
+
   try {
-    const { socket, certificado } = await tls.conectar({
+    const { socket, certificado, alpn } = await tls.conectar({
       host,
       port: 443,
       verificar: true,
-      timeout: opciones.timeoutMs
+      timeout: opciones.timeoutMs,
+      alpnProtocols: ALPN
     });
     socketCerrar(socket);
     addLog(result, { level: 'info', channel: 'tls', message: `Certificado de ${host} valido` });
-    return { certificado, verificado: true, motivoRechazo: null, error: null, auditar: tls.auditarCertificado };
+    return { certificado, verificado: true, motivoRechazo: null, error: null, auditar: tls.auditarCertificado, alpn: alpn || certificado?.alpn || null };
   } catch (error) {
     addLog(result, { level: 'info', channel: 'tls', message: `Certificado de ${host} no validado: ${error.message}` });
   }
 
   try {
-    const { socket, certificado, avisos } = await tls.conectar({
+    const { socket, certificado, avisos, alpn } = await tls.conectar({
       host,
       port: 443,
       verificar: false,
-      timeout: opciones.timeoutMs
+      timeout: opciones.timeoutMs,
+      alpnProtocols: ALPN
     });
     socketCerrar(socket);
     // `avisos` se descarta a propósito: los que `conectar` añade sin
@@ -383,7 +400,8 @@ async function consultarTls(result, host, opciones, ctx) {
       verificado: false,
       motivoRechazo: certificado?.motivoRechazo || null,
       error: null,
-      auditar: tls.auditarCertificado
+      auditar: tls.auditarCertificado,
+      alpn: alpn || certificado?.alpn || null
     };
   } catch (error) {
     addLog(result, { level: 'warn', channel: 'tls', message: `No se pudo leer el certificado: ${error.message}` });
@@ -478,6 +496,214 @@ async function compararResolvers(result, host, opciones, ctx) {
   return filas;
 }
 
+/**
+ * Lee las cabeceras de seguridad de la respuesta y las traduce a una tabla y a
+ * hallazgos.
+ *
+ * Es una función PURA para que la tabla y los hallazgos no puedan discrepar: lo
+ * que se enseña y lo que se avisa salen del mismo cálculo. Un informe que lista
+ * "Content-Security-Policy: ausente" y no lo cuenta en el diagnóstico (o al
+ * revés) hace dudar de todo lo demás.
+ *
+ * La severidad no es la misma para todas: sin HSTS o sin CSP el sitio funciona,
+ * pero pierde defensas que un tercero puede aprovechar; sin `Referrer-Policy`
+ * solo se filtra un poco más de contexto. Tratar las seis igual convertiría el
+ * informe en una lista de deberes en la que nada destaca.
+ *
+ * @returns {{filas: Array, hallazgos: Array, hsts: boolean}}
+ */
+function analizarCabeceras(cabeceras = {}, { https } = {}) {
+  const c = {};
+  for (const [clave, valor] of Object.entries(cabeceras || {})) {
+    c[String(clave).toLowerCase()] = Array.isArray(valor) ? valor.join(', ') : valor;
+  }
+
+  const filas = [];
+  const hallazgos = [];
+
+  const hsts = c['strict-transport-security'] || null;
+  const csp = c['content-security-policy'] || null;
+  const xcto = c['x-content-type-options'] || null;
+  const xfo = c['x-frame-options'] || null;
+  const referrer = c['referrer-policy'] || null;
+  const permisos = c['permissions-policy'] || null;
+
+  const fila = (nombre, valor, presente) => {
+    filas.push([nombre, { valor: presente ? 'Presente' : 'Ausente', tone: presente ? 'ok' : 'warn' }, valor || '—']);
+  };
+
+  // HSTS solo tiene sentido sobre https: en una respuesta http la cabecera se
+  // ignora por definición y avisar de su ausencia sería inventar un problema.
+  if (https) {
+    fila('Strict-Transport-Security', hsts, Boolean(hsts));
+    if (!hsts) {
+      hallazgos.push({
+        severity: SEVERIDADES.WARN,
+        title: 'El sitio no fuerza HTTPS en las visitas posteriores (sin HSTS)',
+        detail: 'No envía la cabecera Strict-Transport-Security. Sin ella, la primera visita a http:// sigue siendo interceptable y el navegador no recuerda exigir https las siguientes veces.',
+        recommendation: "Añade `Strict-Transport-Security: max-age=63072000; includeSubDomains` cuando el certificado y las redirecciones estén listos. Empieza con un max-age bajo y súbelo."
+      });
+    } else {
+      const maxAge = Number((hsts.match(/max-age\s*=\s*(\d+)/i) || [])[1]);
+      if (Number.isFinite(maxAge) && maxAge < 15552000) {
+        hallazgos.push({
+          severity: SEVERIDADES.INFO,
+          title: 'La política HSTS caduca pronto',
+          detail: `El max-age es de ${maxAge} segundos (menos de 180 días). Con valores bajos, el navegador deja de exigir https entre visitas.`,
+          recommendation: 'Súbelo a 31536000 (un año) cuando todo el sitio funcione por https, incluidos los subdominios.'
+        });
+      }
+      if (!/includeSubDomains/i.test(hsts)) {
+        hallazgos.push({
+          severity: SEVERIDADES.INFO,
+          title: 'HSTS no cubre los subdominios',
+          detail: 'La cabecera incluye max-age, pero no `includeSubDomains`: un subdominio puede seguir sirviéndose por http.',
+          recommendation: 'Añade `includeSubDomains` si todos los subdominios tienen certificado y hablan https.'
+        });
+      }
+    }
+  }
+
+  fila('Content-Security-Policy', csp, Boolean(csp));
+  if (!csp) {
+    hallazgos.push({
+      severity: SEVERIDADES.WARN,
+      title: 'El sitio no define una política de seguridad de contenido (CSP)',
+      detail: 'Sin Content-Security-Policy, el navegador ejecuta cualquier script que llegue a la página. Es la defensa principal contra el código inyectado.',
+      recommendation: 'Empieza con `Content-Security-Policy: default-src \'self\'` en modo informe para ver qué se rompe, y ve abriendo lo que necesites.'
+    });
+  } else if (/unsafe-inline|unsafe-eval/i.test(csp)) {
+    hallazgos.push({
+      severity: SEVERIDADES.WARN,
+      title: 'La CSP permite código incrustado (unsafe-inline o unsafe-eval)',
+      detail: 'La política existe, pero `unsafe-inline`/`unsafe-eval` dejan pasar el script incrustado en el HTML, que es justo el vehículo del XSS.',
+      recommendation: 'Sustituye el script incrustado por un fichero propio y usa nonces o hashes. Quita `unsafe-inline`/`unsafe-eval` cuando lo hayas hecho.'
+    });
+  }
+
+  const nosniff = /nosniff/i.test(xcto || '');
+  fila('X-Content-Type-Options', xcto, nosniff);
+  if (!nosniff) {
+    hallazgos.push({
+      severity: SEVERIDADES.WARN,
+      title: 'Falta X-Content-Type-Options: nosniff',
+      detail: 'Sin esta cabecera, el navegador puede adivinar el tipo de un fichero por su contenido y tratar como script algo que no lo es.',
+      recommendation: 'Añade `X-Content-Type-Options: nosniff`. No rompe nada y quita una vía clásica de ataque.'
+    });
+  }
+
+  const protegido = Boolean(xfo) || /frame-ancestors/i.test(csp || '');
+  fila('X-Frame-Options / frame-ancestors', xfo || (/frame-ancestors/i.test(csp || '') ? 'frame-ancestors' : null), protegido);
+  if (!protegido) {
+    hallazgos.push({
+      severity: SEVERIDADES.WARN,
+      title: 'El sitio se puede incrustar en otra página (sin protección de framing)',
+      detail: 'No hay X-Frame-Options ni `frame-ancestors` en la CSP. Otra web puede meter esta dentro de un iframe y superponer botones encima (clickjacking).',
+      recommendation: "Añade `X-Frame-Options: DENY` (o SAMEORIGIN) o, mejor, `frame-ancestors 'none'` dentro de la CSP."
+    });
+  }
+
+  fila('Referrer-Policy', referrer, Boolean(referrer));
+  if (!referrer) {
+    hallazgos.push({
+      severity: SEVERIDADES.INFO,
+      title: 'No hay Referrer-Policy',
+      detail: 'Sin ella, el navegador manda la URL completa como referer a los terceros a los que enlaza la página.',
+      recommendation: "Añade `Referrer-Policy: strict-origin-when-cross-origin`. Es una línea y evita filtrar rutas internas."
+    });
+  }
+
+  fila('Permissions-Policy', permisos, Boolean(permisos));
+  if (!permisos) {
+    hallazgos.push({
+      severity: SEVERIDADES.INFO,
+      title: 'No hay Permissions-Policy',
+      detail: 'La página no declara qué funciones del navegador (cámara, ubicación, micrófono) pueden usar ella y sus iframes.',
+      recommendation: "Añade `Permissions-Policy` apagando lo que no uses, por ejemplo `geolocation=(), camera=(), microphone=()`."
+    });
+  }
+
+  // Versión del servidor: no es una defensa que falte, es una pista que se
+  // regala. `nginx` a secas no dice nada; `nginx/1.25.3` sí.
+  const servidor = String(c.server || '');
+  if (xPoweredByPeligroso(c) || /\/\d/.test(servidor)) {
+    hallazgos.push({
+      severity: SEVERIDADES.INFO,
+      title: 'El servidor publica su versión',
+      detail: `La respuesta incluye ${c['x-powered-by'] ? `X-Powered-By: ${c['x-powered-by']}` : `Server: ${servidor}`}. Eso le dice a quien busca a qué versión concreta atacar.`,
+      recommendation: 'Oculta la versión: en nginx, `server_tokens off`; en Apache, `ServerTokens Prod`; y quita X-Powered-By del framework.'
+    });
+  }
+
+  return { filas, hallazgos, hsts: Boolean(hsts) };
+}
+
+/** El framework se delata con X-Powered-By: eso es información de más. */
+function xPoweredByPeligroso(c) {
+  return Boolean(c['x-powered-by']);
+}
+
+/**
+ * Qué versiones de HTTP anuncia el sitio, cruzando lo que dice el handshake TLS
+ * con lo que publica el registro HTTPS de DNS.
+ *
+ * Son dos fuentes a propósito: el ALPN de TLS solo puede ver h2 y http/1.1,
+ * porque HTTP/3 va sobre QUIC y no pasa por ahí. El registro HTTPS es el único
+ * sitio donde el servidor declara h3 de antemano.
+ *
+ * @returns {{alpnTls:string|null, alpnDns:string[], h2:boolean, h3:boolean, conocido:boolean}}
+ */
+function determinarProtocolo(tls, https) {
+  const alpnTls = tls?.alpn || tls?.certificado?.alpn || null;
+  const params = (https?.ok && https.valores?.[0]?.params) || [];
+  const parametroAlpn = params.find((p) => p.key === 1)?.valor;
+  const alpnDns = Array.isArray(parametroAlpn) ? parametroAlpn : [];
+  return {
+    alpnTls,
+    alpnDns,
+    h2: alpnTls === 'h2' || alpnDns.includes('h2'),
+    h3: alpnDns.includes('h3'),
+    conocido: Boolean(alpnTls) || alpnDns.length > 0
+  };
+}
+
+/**
+ * Nota TLS del sitio, reutilizando el calificador de `tls-checker`.
+ *
+ * Solo se intenta si el módulo inyectado sabe sondear protocolos y calificar.
+ * Los dobles de las pruebas no lo hacen y tampoco pasa nada: la sección que la
+ * pinta solo aparece cuando hay algo medido que enseñar.
+ */
+async function calificarConexion(tls, cabeceras, url, opciones, ctx) {
+  if (url.protocol !== 'https:' || !tls || tls.error || !tls.certificado) return null;
+  const tlsMod = ctx.tls || tlsNet;
+  if (typeof tlsMod.sondearProtocolos !== 'function' || typeof tlsMod.calcularNota !== 'function') return null;
+
+  const host = url.hostname;
+  try {
+    const protocolos = await tlsMod.sondearProtocolos({ host, port: 443, timeout: opciones.timeoutMs });
+    const certificado = tls.certificado;
+    const nota = tlsMod.calcularNota({
+      protocoloNegociado: certificado.protocolo,
+      protocolos,
+      certificado,
+      cifradoDebil: typeof tlsMod.esCifradoDebil === 'function' ? tlsMod.esCifradoDebil(certificado.cifrado) : false,
+      forwardSecrecy: typeof tlsMod.tieneForwardSecrecy === 'function' ? tlsMod.tieneForwardSecrecy(certificado.cifrado, certificado.protocolo) : true,
+      ocspStapled: certificado.ocspStapled ?? null,
+      hsts: cabeceras ? { presente: cabeceras.hsts } : null
+    });
+    return { protocolos, nota };
+  } catch (error) {
+    addLogSafe(ctx, `No se pudo calificar la conexión: ${error.message}`);
+    return null;
+  }
+}
+
+/** Log opcional: el contexto puede no traerlo. */
+function addLogSafe(ctx, mensaje) {
+  ctx?.log?.warn?.(`web-checker: ${mensaje}`);
+}
+
 /* ------------------------------------------------------------------ *
  * Presentación
  * ------------------------------------------------------------------ */
@@ -522,7 +748,7 @@ function tonoEstado(estado) {
 }
 
 /** El bloque de debajo: por qué pasó esto. */
-function pintarDiagnostico(result, { url, r, dns, tls, registro }) {
+function pintarDiagnostico(result, { url, r, dns, tls, registro, cabeceras, protocolo, conexion }) {
   const fallo = Boolean(r.error);
 
   addSection(result, {
@@ -589,6 +815,38 @@ function pintarDiagnostico(result, { url, r, dns, tls, registro }) {
     });
   }
 
+  if (cabeceras) {
+    addSection(result, {
+      title: 'Cabeceras de seguridad',
+      description:
+        'Defensas que el servidor añade a la respuesta. Que falte alguna no tumba el sitio, pero deja una puerta que un tercero puede empujar.',
+      kind: K.TABLA,
+      columns: ['Cabecera', 'Estado', 'Valor'],
+      anchoColumnas: [30, 10, 46],
+      rows: cabeceras.filas
+    });
+  }
+
+  if (conexion || protocolo?.conocido) {
+    const items = [];
+    if (conexion?.nota) {
+      items.push(['Nota TLS', `${conexion.nota.letra} (${conexion.nota.puntos}/100)`, tonoNota(conexion.nota.letra)]);
+      items.push(['Resumen TLS', conexion.nota.resumen]);
+    }
+    if (conexion?.protocolos) items.push(['Versiones TLS aceptadas', describirProtocolos(conexion.protocolos)]);
+    if (protocolo?.conocido) {
+      items.push(['HTTP/2', protocolo.h2 ? 'Sí, negociado' : 'No detectado']);
+      items.push(['HTTP/3', protocolo.h3 ? 'Sí, anunciado en DNS' : 'No anunciado']);
+    }
+    addSection(result, {
+      title: 'Seguridad de la conexión',
+      description:
+        'La nota resume el certificado, las versiones de TLS y el cifrado negociado. Los apartados grises son los que este cliente moderno ya no sabe medir (TLS 1.0/1.1).',
+      kind: K.PARES,
+      items
+    });
+  }
+
   if (registro?.aplica) {
     const d = registro.datos;
     addSection(result, {
@@ -612,6 +870,33 @@ function textoValores(registro) {
   if (!registro) return 'Sin dato';
   if (registro.ok) return registro.valores.length ? registro.valores.join(', ') : 'Ninguna';
   return registro.error || 'Sin dato';
+}
+
+/** El color de la nota TLS, con la misma escala que `tls-checker`. */
+function tonoNota(letra) {
+  if (letra === 'A' || letra === 'B') return 'ok';
+  if (letra === 'C') return 'neutral';
+  if (letra === 'D') return 'warn';
+  return 'bad';
+}
+
+/**
+ * Resume el mapa de versiones TLS en una frase.
+ *
+ * La distinción que no se puede perder es `false` (el servidor la rechaza) frente
+ * a `null` (este cliente no ha podido medirla, normalmente porque OpenSSL ya no
+ * ofrece TLS 1.0/1.1). Meterlas en el mismo saco afirmaría un rechazo que nadie
+ * ha comprobado.
+ */
+function describirProtocolos(protocolos = {}) {
+  const aceptadas = Object.entries(protocolos).filter(([, v]) => v === true).map(([k]) => k);
+  const rechazadas = Object.entries(protocolos).filter(([, v]) => v === false).map(([k]) => k);
+  const sinMedir = Object.entries(protocolos).filter(([, v]) => v == null).map(([k]) => k);
+  const partes = [];
+  partes.push(aceptadas.length ? `Acepta ${aceptadas.join(', ')}` : 'No acepta ninguna versión moderna');
+  if (rechazadas.length) partes.push(`rechaza ${rechazadas.join(', ')}`);
+  if (sinMedir.length) partes.push(`${sinMedir.join(', ')} sin poder medir desde este cliente`);
+  return `${partes.join('; ')}.`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -661,7 +946,7 @@ function titularDe(host, r) {
  * certificado o al preguntar al registro deja un agujero en el informe, no
  * evidencia de que el sitio esté mal. Se dice con esas palabras.
  */
-function revisar(result, { url, r, dns, tls, registro }) {
+function revisar(result, { url, r, dns, tls, registro, cabeceras, conexion, protocolo }) {
   const host = url.hostname;
   setHeadline(result, titularDe(host, r));
 
@@ -674,6 +959,8 @@ function revisar(result, { url, r, dns, tls, registro }) {
   } else {
     bloqueantes.push(...revisarHttp(result, host, r));
     revisarDificultades(result, host, r);
+    revisarCabeceras(result, cabeceras);
+    revisarConexion(result, { conexion, protocolo, url });
   }
 
   revisarDns(result, host, dns, r);
@@ -681,6 +968,50 @@ function revisar(result, { url, r, dns, tls, registro }) {
   revisarRegistro(result, host, registro);
 
   ajustarGravedad(result, { host, r, bloqueantes });
+}
+
+/**
+ * Vuelca los hallazgos de las cabeceras ya analizadas.
+ *
+ * No vuelve a decidir nada: la severidad y el texto salieron de
+ * `analizarCabeceras`, la misma función que pinta la tabla. Así lo que se ve y
+ * lo que se avisa no pueden separarse.
+ */
+function revisarCabeceras(result, cabeceras) {
+  if (!cabeceras) return;
+  for (const f of cabeceras.hallazgos) addFinding(result, f);
+}
+
+/**
+ * La nota TLS y las versiones de HTTP, como hallazgo cuando hay algo que decir.
+ *
+ * Una nota baja se cuenta una vez, con su motivo, en vez de repetir uno por uno
+ * los problemas que el auditor del certificado ya enumera: dos listas de lo
+ * mismo con palabras distintas es la forma más rápida de que el usuario deje de
+ * leerlas.
+ */
+function revisarConexion(result, { conexion, protocolo, url }) {
+  if (url.protocol !== 'https:') return;
+
+  if (conexion?.nota && conexion.nota.letra === 'F') {
+    addFinding(result, {
+      severity: SEVERIDADES.WARN,
+      title: `La configuración TLS suspende (nota ${conexion.nota.letra})`,
+      detail: conexion.nota.resumen,
+      recommendation: 'Revisa los apartados del certificado y de las versiones de TLS. Una nota F suele ser un protocolo obsoleto, un cifrado roto o un certificado que no valida.'
+    });
+  }
+
+  // Solo se avisa si se MIDIÓ que habla HTTP/1.1. Si no se pudo detectar (un
+  // servidor que no negocia ALPN), callar es más honesto que afirmar un atraso.
+  if (protocolo?.conocido && !protocolo.h2 && !protocolo.h3 && protocolo.alpnTls) {
+    addFinding(result, {
+      severity: SEVERIDADES.INFO,
+      title: 'El sitio no ofrece HTTP/2 ni HTTP/3',
+      detail: `El handshake negoció ${protocolo.alpnTls} y el registro DNS no anuncia h3. Con HTTP/1.1 cada recurso de la página abre su propia conexión.`,
+      recommendation: 'Activa HTTP/2 en el servidor o el proxy. Es gratis en los servidores actuales y acelera la carga sin tocar el código.'
+    });
+  }
 }
 
 /**
@@ -1126,8 +1457,14 @@ module.exports = {
     revisarDns,
     revisarTls,
     revisarRegistro,
+    revisarCabeceras,
+    revisarConexion,
     pintarDiagnostico,
     pintarHechos,
+    analizarCabeceras,
+    determinarProtocolo,
+    calificarConexion,
+    describirProtocolos,
     ajustarGravedad,
     diasPara,
     canonico

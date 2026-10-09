@@ -73,6 +73,8 @@ function esIp(host) {
  * @param {boolean} [options.requestOCSP=false] Pedir stapling OCSP al servidor.
  * @param {string} [options.minVersion] Version TLS minima para forzar el sondeo.
  * @param {string} [options.maxVersion] Version TLS maxima para forzar el sondeo.
+ * @param {string[]} [options.alpnProtocols] Protocolos de aplicacion que ofrecer
+ *   (p. ej. `['h2', 'http/1.1']`). Permite saber si el servidor negocia HTTP/2.
  * @returns {Promise<{socket, certificado, avisos, ocsp}>}
  * @throws {NetlabError} Si no se puede establecer la conexion.
  */
@@ -85,7 +87,8 @@ function conectar(options) {
     servername,
     requestOCSP = false,
     minVersion,
-    maxVersion
+    maxVersion,
+    alpnProtocols
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -112,6 +115,7 @@ function conectar(options) {
     };
     if (minVersion) opciones.minVersion = minVersion;
     if (maxVersion) opciones.maxVersion = maxVersion;
+    if (alpnProtocols?.length) opciones.ALPNProtocols = alpnProtocols;
 
     let socket;
     try {
@@ -144,7 +148,8 @@ function conectar(options) {
             socket,
             certificado: inspeccionar(socket, { ocsp: respuestaOcsp }),
             avisos,
-            ocsp: respuestaOcsp
+            ocsp: respuestaOcsp,
+            alpn: socket.alpnProtocol ? String(socket.alpnProtocol) : null
           })
         );
 
@@ -278,6 +283,7 @@ function inspeccionar(socket, extras = {}) {
     tamanoClave,
     protocolo: socket.getProtocol ? socket.getProtocol() : null,
     cifrado: socket.getCipher ? socket.getCipher()?.name : null,
+    alpn: socket.alpnProtocol || null,
     nombresAlternativos: nombresAlternativos.filter((n) => n.startsWith('DNS:')),
     cadena: cadenaDe(socket),
     autoridadCertificadora: (socket.authorized ?? null) === true,

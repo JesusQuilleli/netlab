@@ -36,7 +36,19 @@ function responde(extra = {}) {
     urlFinal: 'https://ejemplo.com/',
     cadena: [{ url: 'https://ejemplo.com/', estado: 200 }],
     metodo: 'HEAD',
-    cabeceras: { server: 'nginx', 'content-type': 'text/html' },
+    // Un sitio sano moderno: además del contenido, trae las defensas habituales.
+    // Sin ellas el informe avisaría con razón y la prueba de "sitio sano" dejaría
+    // de significar lo que dice.
+    cabeceras: {
+      server: 'nginx',
+      'content-type': 'text/html',
+      'strict-transport-security': 'max-age=63072000; includeSubDomains; preload',
+      'content-security-policy': "default-src 'self'",
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'strict-origin-when-cross-origin',
+      'permissions-policy': 'geolocation=(), camera=(), microphone=()'
+    },
     titulo: 'Ejemplo — Inicio',
     cuerpo: '<html><head><title>Ejemplo — Inicio</title></head></html>',
     truncado: false,
@@ -240,7 +252,7 @@ test('el sitio sano enseña los hechos y las cuatro comprobaciones', async () =>
 
   assert.deepEqual(
     r.sections.map((s) => s.title),
-    ['Qué ha pasado', 'Direcciones del nombre', 'Certificado', 'Caducidad del dominio']
+    ['Qué ha pasado', 'Direcciones del nombre', 'Certificado', 'Cabeceras de seguridad', 'Caducidad del dominio']
   );
 });
 
@@ -949,4 +961,172 @@ test('el JSON del informe lleva el esquema y el titular', async () => {
   assert.equal(json.tool, 'web-checker');
   assert.equal(json.headline, 'ejemplo.com está operativa');
   assert.ok(Array.isArray(json.sections));
+});
+
+/* ------------------------------------------------------------------ *
+ * Cabeceras de seguridad
+ * ------------------------------------------------------------------ */
+
+const CABECERAS_BLINDADAS = {
+  'strict-transport-security': 'max-age=63072000; includeSubDomains',
+  'content-security-policy': "default-src 'self'",
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'permissions-policy': 'geolocation=()'
+};
+
+test('analizarCabeceras: un sitio blindado no levanta ningún hallazgo', () => {
+  const { hallazgos, filas } = webChecker._internas.analizarCabeceras(CABECERAS_BLINDADAS, { https: true });
+  assert.deepEqual(hallazgos, []);
+  assert.equal(filas.length, 6);
+  assert.equal(filas[0][0], 'Strict-Transport-Security');
+});
+
+test('analizarCabeceras: sin cabeceras avisa de las defensas que faltan', () => {
+  const { hallazgos } = webChecker._internas.analizarCabeceras({}, { https: true });
+  const buscar = (trozo) => hallazgos.find((f) => f.title.includes(trozo));
+
+  assert.equal(buscar('HSTS').severity, SEVERIDADES.WARN);
+  assert.equal(buscar('contenido (CSP)').severity, SEVERIDADES.WARN);
+  assert.equal(buscar('nosniff').severity, SEVERIDADES.WARN);
+  assert.equal(buscar('incrustar').severity, SEVERIDADES.WARN);
+  assert.equal(buscar('Referrer-Policy').severity, SEVERIDADES.INFO);
+  assert.equal(buscar('Permissions-Policy').severity, SEVERIDADES.INFO);
+});
+
+test('analizarCabeceras: sobre http no se exige HSTS', () => {
+  // La cabecera HSTS solo la lee el navegador por https. Avisar de su ausencia
+  // en una respuesta http sería inventar un problema.
+  const { hallazgos } = webChecker._internas.analizarCabeceras({}, { https: false });
+  assert.ok(!hallazgos.some((f) => /HSTS/.test(f.title)));
+});
+
+test('analizarCabeceras: la CSP con unsafe-inline pierde fuerza', () => {
+  const { hallazgos } = webChecker._internas.analizarCabeceras(
+    { 'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'", 'x-frame-options': 'DENY' },
+    { https: false }
+  );
+  assert.ok(hallazgos.some((f) => /unsafe-inline/.test(f.title)));
+});
+
+test('analizarCabeceras: frame-ancestors en la CSP cuenta como protección de framing', () => {
+  const { hallazgos } = webChecker._internas.analizarCabeceras(
+    { 'content-security-policy': "default-src 'self'; frame-ancestors 'none'" },
+    { https: false }
+  );
+  assert.ok(!hallazgos.some((f) => /incrustar/.test(f.title)));
+});
+
+test('analizarCabeceras: la versión del servidor es una pista, no un fallo', () => {
+  const conVersion = webChecker._internas.analizarCabeceras({ server: 'nginx/1.25.3' }, { https: false });
+  const f = conVersion.hallazgos.find((x) => /versión/.test(x.title));
+  assert.equal(f.severity, SEVERIDADES.INFO);
+
+  // `nginx` a secas no revela ninguna versión y no debe disparar el aviso.
+  const limpio = webChecker._internas.analizarCabeceras({ server: 'nginx' }, { https: false });
+  assert.ok(!limpio.hallazgos.some((x) => /versión/.test(x.title)));
+});
+
+test('un sitio sin cabeceras de seguridad se avisa, pero no se llama caída', async () => {
+  const r = await webChecker.ejecutar(
+    { url: 'ejemplo.com' },
+    contexto({ web: { sondear: async () => responde({ cabeceras: { server: 'nginx', 'content-type': 'text/html' } }) } })
+  );
+
+  assert.equal(r.status, ESTADOS.WARN);
+  assert.equal(r.headline, 'ejemplo.com está operativa');
+  assert.ok(r.sections.some((s) => s.title === 'Cabeceras de seguridad'));
+  assert.ok(titulos(r).some((t) => /HSTS/.test(t)));
+});
+
+/* ------------------------------------------------------------------ *
+ * HTTP/2 y HTTP/3
+ * ------------------------------------------------------------------ */
+
+test('determinarProtocolo cruza el ALPN de TLS con el registro HTTPS', () => {
+  const d = webChecker._internas.determinarProtocolo;
+  const https = {
+    ok: true,
+    valores: [{ prioridad: 1, destino: '.', params: [{ key: 1, nombre: 'alpn', valor: ['h3', 'h2'] }] }]
+  };
+
+  assert.deepEqual(d({ alpn: 'h2' }, https), {
+    alpnTls: 'h2',
+    alpnDns: ['h3', 'h2'],
+    h2: true,
+    h3: true,
+    conocido: true
+  });
+  assert.equal(d({ alpn: 'http/1.1' }, null).h2, false);
+  assert.equal(d(null, null).conocido, false, 'sin datos no se inventa nada');
+});
+
+test('describirProtocolos no confunde rechazar con no poder medir', () => {
+  const texto = webChecker._internas.describirProtocolos({
+    'TLSv1.3': true,
+    'TLSv1.2': true,
+    'TLSv1.1': false,
+    'TLSv1': null
+  });
+  assert.match(texto, /Acepta TLSv1\.3, TLSv1\.2/);
+  assert.match(texto, /rechaza TLSv1\.1/);
+  assert.match(texto, /TLSv1 sin poder medir/);
+});
+
+test('el registro HTTPS anuncia HTTP/3 y se enseña en el informe', async () => {
+  const dns = dnsFalso({
+    'ejemplo.com': {
+      A: ok(['93.184.216.34']),
+      AAAA: ok([]),
+      HTTPS: ok([{ prioridad: 1, destino: '.', params: [{ key: 1, nombre: 'alpn', valor: ['h3', 'h2'] }] }])
+    }
+  });
+
+  const r = await webChecker.ejecutar({ url: 'ejemplo.com' }, contexto({ dns }));
+
+  const seccion = r.sections.find((s) => s.title === 'Seguridad de la conexión');
+  assert.ok(seccion, 'debe aparecer la sección de conexión');
+  assert.ok(seccion.items.some(([k, v]) => k === 'HTTP/3' && /Sí/.test(v)));
+  assert.ok(seccion.items.some(([k, v]) => k === 'HTTP/2' && /Sí/.test(v)));
+});
+
+test('la nota TLS se calcula con el calificador compartido', async () => {
+  const tls = {
+    conectar: async () => ({
+      socket: { destroy() {} },
+      certificado: { ...TLS_SANO.certificado, protocolo: 'TLSv1.2', cifrado: 'ECDHE-RSA-AES256-GCM-SHA384' },
+      alpn: 'h2',
+      avisos: []
+    }),
+    auditarCertificado: () => [],
+    sondearProtocolos: async () => ({ 'TLSv1.3': true, 'TLSv1.2': true, 'TLSv1.1': false, 'TLSv1': false }),
+    calcularNota: () => ({ letra: 'A', puntos: 98, resumen: 'Configuración TLS sólida.', deducciones: [], caps: [] }),
+    esCifradoDebil: () => false,
+    tieneForwardSecrecy: () => true
+  };
+
+  const r = await webChecker.ejecutar({ url: 'ejemplo.com' }, contexto({ tls }));
+
+  const seccion = r.sections.find((s) => s.title === 'Seguridad de la conexión');
+  assert.ok(seccion);
+  assert.ok(seccion.items.some(([k, v]) => k === 'Nota TLS' && /A \(98\/100\)/.test(v)));
+});
+
+test('un sitio que solo negocia HTTP/1.1 se anota como observación', async () => {
+  const tls = {
+    conectar: async () => ({
+      socket: { destroy() {} },
+      certificado: { ...TLS_SANO.certificado, protocolo: 'TLSv1.2', cifrado: 'ECDHE-RSA-AES256-GCM-SHA384' },
+      alpn: 'http/1.1',
+      avisos: []
+    }),
+    auditarCertificado: () => []
+  };
+
+  const r = await webChecker.ejecutar({ url: 'ejemplo.com' }, contexto({ tls }));
+
+  const f = r.findings.find((x) => /HTTP\/2 ni HTTP\/3/.test(x.title));
+  assert.ok(f, `se esperaba el aviso de HTTP/1.1: ${titulos(r).join(' | ')}`);
+  assert.equal(f.severity, SEVERIDADES.INFO);
 });
