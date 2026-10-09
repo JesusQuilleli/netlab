@@ -30,6 +30,8 @@ const {
 const { NetlabError, CODES } = require('../core/errors');
 const { redactDeep } = require('../core/redact');
 const dnsNet = require('../core/net/dns');
+const spfCore = require('../core/mail/spf');
+const dmarcCore = require('../core/mail/dmarc');
 const {
   parsear: parsearEsperado,
   normalizarNombre,
@@ -64,7 +66,7 @@ const DNSSEC_DIAGNOSTICOS = ['DNSKEY', 'DS'];
  * nombre sino de una dirección, así que consultarlo aquí no significa nada.
  * Tiene su propio campo, que es donde se introduce la IP.
  */
-const TIPOS_SOPORTADOS = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA', 'SRV', ...TIPOS_DNSSEC];
+const TIPOS_SOPORTADOS = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'CAA', 'SRV', 'HTTPS', 'SVCB', ...TIPOS_DNSSEC];
 
 /** Respuestas definitivas: un NXDOMAIN no se rellena de avisos. */
 const CODIGO_DEFINITIVO = 'ENOTFOUND';
@@ -682,6 +684,9 @@ function revisar(result, { dominio, tipos, mapa, registros, ipInversa, ptr, dmar
     });
   }
 
+  // --- Servicios (HTTPS / SVCB) ---
+  revisarServicio(result, { dominio, https: mapa.get('HTTPS'), svcb: mapa.get('SVCB') });
+
   // --- TTL muy bajo ---
   const ttlBajo = [a, aaaa].filter((r) => r?.ok && typeof r.ttl === 'number' && r.ttl < 60);
   if (ttlBajo.length) {
@@ -792,6 +797,32 @@ function revisarDnssec(result, { dominio, dnskey, ds }) {
           detail: `El DS anuncia ${ds.valores.map((d) => `keyTag ${d.keyTag}`).join(', ')}, pero el dominio publica ${[...tagsPublicados].map((t) => `keyTag ${t}`).join(', ')}. El validador no puede casar los dos lados.`,
           recommendation: 'O el DS apunta a una clave retirada (actualízalo a la KSK actual) o falta publicar en la zona la KSK que el DS promete. Nuevo DS y clave han de convivir durante la transición.'
         });
+      } else {
+        // El keyTag coincide, pero eso solo empareja por etiqueta. La prueba de
+        // verdad es recalcular el digest del DS sobre la DNSKEY publicada y ver
+        // si sale el mismo: un DS con el keyTag correcto pero el digest de otra
+        // clave rompe la validacion igual.
+        const rotos = coinciden.filter((d) => {
+          const clave = dnskey.valores.find((v) => v.keyTag === d.keyTag);
+          const calculado = dnsNet.calcularDigestoDs(clave, dominio, d.digestType);
+          return calculado !== null && calculado !== d.digestHex;
+        });
+
+        if (rotos.length) {
+          addFinding(result, {
+            severity: SEVERIDADES.ERROR,
+            title: 'El DS no coincide con el contenido de la clave',
+            detail: `El DS con keyTag ${rotos.map((d) => d.keyTag).join(', ')} tiene un digest que no se corresponde con el calculado sobre la DNSKEY publicada. El keyTag encaja, pero el contenido no: un validador rechaza la cadena igual y la resolución acaba en SERVFAIL.`,
+            recommendation: `Vuelve a generar el DS a partir de la KSK actual: el digest cubre el nombre de la zona y la clave entera. Suele pasar al dejar un DS viejo o de otra clave que comparte keyTag.`
+          });
+        } else {
+          addFinding(result, {
+            severity: SEVERIDADES.INFO,
+            title: 'El DS verifica contra la clave publicada',
+            detail: `El digest del DS coincide con el recalculado sobre la KSK publicada (keyTag ${coinciden.map((d) => d.keyTag).join(', ')}). La cadena de confianza está bien construida.`,
+            recommendation: 'No hay nada que corregir. Al rotar la clave, publica el nuevo DS y espera a que propague antes de retirar el antiguo.'
+          });
+        }
       }
     }
   } else if (ds) {
@@ -870,28 +901,174 @@ function revisarDiferencias(result, dominio, diferencias) {
 
 /** Revisa SPF y DMARC, que solo tienen sentido si hay correo. */
 function revisarCorreo(result, txt, dmarc, dominio) {
-  const registros = txt?.ok ? txt.valores : [];
-  const textos = registros.map((t) => formatear(t));
-  const tieneSpf = textos.some((t) => /^\s*v=spf1\b/i.test(t));
-  const tieneDmarc = Boolean(dmarc?.ok) && dmarc.valores.some((t) => /v=DMARC1/i.test(formatear(t)));
+  const textos = (txt?.ok ? txt.valores : []).map((t) => formatear(t));
+  const politica = dmarcCore.parsear(dmarc?.ok ? dmarc.valores.map((t) => formatear(t)) : []);
 
-  if (!tieneSpf) {
+  const spf = spfCore.parsear(textos);
+
+  // --- SPF ---
+  if (!spf.presente) {
     addFinding(result, {
       severity: SEVERIDADES.WARN,
       title: 'Sin registro SPF',
       detail: `No hay ningún TXT con v=spf1 en ${dominio}, así que no se declara qué servidores pueden enviar en su nombre.`,
-      recommendation: 'Añade un TXT con v=spf1. Sin él, el correo que sale con tu nombre es más propenso a que lo rechacen o a que acabe marcado como phishing.'
+      recommendation: 'Añade un TXT con v=spf1 autorizando solo a tus servidores y terminando en "-all".'
     });
+  } else {
+    for (const error of spf.errores) {
+      addFinding(result, {
+        severity: SEVERIDADES.ERROR,
+        title: 'SPF mal configurado',
+        detail: error,
+        recommendation: 'Corrige el registro SPF: cada error invalida la comprobación y deja el dominio peor protegido que sin publicarlo.'
+      });
+    }
+    for (const aviso of spf.avisos) {
+      addFinding(result, {
+        severity: SEVERIDADES.WARN,
+        title: 'SPF mejorable',
+        detail: aviso,
+        recommendation: 'Revisa el registro SPF: un "all" débil o demasiadas consultas hacen que el receptor no aplique la política.'
+      });
+    }
   }
 
-  if (!tieneDmarc) {
+  // --- DMARC ---
+  if (!politica.presente) {
     addFinding(result, {
       severity: SEVERIDADES.WARN,
       title: 'Sin registro DMARC',
       detail: `La consulta a _dmarc.${dominio} no ha devuelto ninguna política.`,
       recommendation: `Publica un DMARC en _dmarc.${dominio}. Es lo que da visibilidad de quién intenta suplantarte y lo que evita que te lo quiten.`
     });
+  } else {
+    for (const error of politica.errores) {
+      addFinding(result, {
+        severity: SEVERIDADES.ERROR,
+        title: 'DMARC mal configurado',
+        detail: error,
+        recommendation: 'Corrige el registro DMARC: un registro inválido equivale a no tenerlo.'
+      });
+    }
+    for (const aviso of politica.avisos) {
+      addFinding(result, {
+        severity: politica.politica === 'none' ? SEVERIDADES.WARN : SEVERIDADES.INFO,
+        title: 'DMARC mejorable',
+        detail: aviso,
+        recommendation: 'Un DMARC que solo observa no protege: pasa a "quarantine" o "reject" cuando los informes confirmen que solo envías tú.'
+      });
+    }
   }
+
+  // --- Tabla resumen SPF/DMARC ---
+  if (spf.presente || politica.presente) {
+    addSection(result, {
+      title: 'Correo (SPF y DMARC)',
+      description: 'Estado de las dos políticas que deciden si el correo que lleva el nombre del dominio es legítimo.',
+      kind: K.TABLA,
+      columns: ['Política', 'Valor', 'Estado'],
+      anchoColumnas: [18, 60, 22],
+      rows: [
+        [
+          'SPF',
+          spf.presente ? recortar(spf.valor, 200) : '—',
+          !spf.presente
+            ? { valor: 'No publicado', tone: 'bad' }
+            : spf.errores.length
+              ? { valor: 'Con errores', tone: 'bad' }
+              : spf.avisos.length
+                ? { valor: 'Con avisos', tone: 'warn' }
+                : { valor: 'Correcto', tone: 'ok' }
+        ],
+        [
+          'Consultas DNS de SPF',
+          spf.presente ? `${spf.lookups} de ${spf.limiteLookups}` : '—',
+          !spf.presente
+            ? { valor: '—', tone: 'neutral' }
+            : spf.excedeLimite
+              ? { valor: 'Excede el límite', tone: 'bad' }
+              : { valor: 'Dentro del límite', tone: 'ok' }
+        ],
+        [
+          'DMARC',
+          politica.presente ? recortar(politica.valor, 200) : '—',
+          !politica.presente
+            ? { valor: 'No publicado', tone: 'bad' }
+            : politica.errores.length
+              ? { valor: 'Con errores', tone: 'bad' }
+              : politica.politica === 'none'
+                ? { valor: 'Solo observa (p=none)', tone: 'warn' }
+                : { valor: 'Correcto', tone: 'ok' }
+        ],
+        [
+          'Informes DMARC (rua)',
+          politica.presente ? politica.rua.join(', ') || '(ninguno)' : '—',
+          politica.presente && politica.rua.length ? { valor: 'Definidos', tone: 'ok' } : { valor: '—', tone: 'neutral' }
+        ]
+      ]
+    });
+  }
+}
+
+/**
+ * Revisa los registros HTTPS/SVCB (RFC 9460).
+ *
+ * Sirven para publicar parámetros de conexión sin abrir puertos extra: el ALPN
+ * que anuncia el servicio (que es como se sabe si el sitio ofrece HTTP/3), el
+ * puerto alternativo, o pistas de dirección. Un registro HTTPS es la forma
+ * correcta de anunciar HTTP/3 hoy.
+ */
+function revisarServicio(result, { dominio, https, svcb }) {
+  const registro = https?.ok && https.valores.length ? https : svcb?.ok && svcb.valores.length ? svcb : null;
+
+  if (!registro) {
+    if (https && https.ok === false && https.codigoDns && https.codigoDns !== 'ENODATA') {
+      addFinding(result, {
+        severity: SEVERIDADES.INFO,
+        title: 'No se pudo consultar el registro HTTPS',
+        detail: `La consulta de HTTPS de ${dominio} falló (${https.codigoDns}).`,
+        recommendation: 'Puede ser un resolutor que no soporta el tipo 65. El registro es opcional; no afecta a la resolución normal.'
+      });
+    }
+    return;
+  }
+
+  const tipo = registro === https ? 'HTTPS' : 'SVCB';
+  const alpn = new Set();
+  for (const r of registro.valores) {
+    const p = (r.params || []).find((x) => x.nombre === 'alpn');
+    if (p && Array.isArray(p.valor)) p.valor.forEach((a) => alpn.add(a));
+  }
+
+  addFinding(result, {
+    severity: SEVERIDADES.INFO,
+    title: `Publica un registro ${tipo}`,
+    detail: alpn.has('h3')
+      ? `${dominio} anuncia HTTP/3 (h3) en su registro ${tipo}. Los clientes que lo soportan pueden usarlo desde la primera conexión.`
+      : `El registro ${tipo} anuncia: ${[...alpn].join(', ') || 'sin ALPN'}.`,
+    recommendation: 'Es informativo: no publicarlo no rompe nada, pero publicarlo ayuda a los clientes a negociar HTTP/3 sin esperar al Alt-Svc.'
+  });
+
+  addSection(result, {
+    title: 'Servicios (HTTPS/SVCB)',
+    description: 'Parámetros de conexión que el dominio publica en DNS (RFC 9460).',
+    kind: K.TABLA,
+    columns: ['Prioridad', 'Destino', 'Parámetros'],
+    anchoColumnas: [10, 24, 66],
+    rows: registro.valores.map((r) => [String(r.prioridad), r.destino || '.', describirParams(r.params)])
+  });
+}
+
+/** Convierte los parámetros SVCB en una cadena legible. */
+function describirParams(params) {
+  if (!params || !params.length) return '—';
+  return params
+    .map((p) => {
+      if (p.nombre === 'no-default-alpn') return 'no-default-alpn';
+      if (Array.isArray(p.valor)) return `${p.nombre}=${p.valor.join(',')}`;
+      return `${p.nombre}=${p.valor}`;
+    })
+    .join(' · ');
 }
 
 /* ------------------------------------------------------------------ *
@@ -928,6 +1105,14 @@ function formatear(valor) {
   if (valor.nsname !== undefined) return `${valor.nsname} (serial ${valor.serial})`; // SOA
   if (valor.issue !== undefined) return `${valor.critical ?? 0} issue "${valor.issue}"`; // CAA
   if (valor.name !== undefined) return valor.name; // PTR
+
+  // SVCB / HTTPS (RFC 9460): prioridad, destino y el ALPN que anuncia.
+  if (valor.prioridad !== undefined && Array.isArray(valor.params)) {
+    const alpn = valor.params.find((p) => p.nombre === 'alpn');
+    const partes = [`${valor.prioridad} ${valor.destino || '.'}`];
+    if (alpn && Array.isArray(alpn.valor)) partes.push(`alpn=${alpn.valor.join(',')}`);
+    return partes.join(' · ');
+  }
 
   // DNSSEC. El orden importa: varias claves comparten campos, y la forma de
   // distinguirlas es el campo que les es propio.

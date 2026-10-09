@@ -12,6 +12,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 
 const dns = require('../src/tools/dns-checker');
 const formats = require('../src/formats');
@@ -74,14 +75,29 @@ function dnsFalso(porTipo, extra = {}) {
 }
 
 /** DNSKEY y DS que casan entre sí, para un dominio firmado sin problemas. */
-function dnssecSano() {
+function dnssecSano(dominio = 'ejemplo.com') {
+  const ksk = { flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 };
+  const digest = digestoDs(dominio, ksk);
   return {
-    DNSKEY: ok([
-      { flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 },
-      { flags: 256, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 34505 }
-    ]),
-    DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }])
+    DNSKEY: ok([ksk, { flags: 256, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 34505 }]),
+    DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest, digestHex: digest.toString('hex') }])
   };
+}
+
+/**
+ * Recalcula el digest de un DS de forma independiente al código de producción,
+ * para que el fixture no pase por construirse con la misma función que se prueba.
+ */
+function digestoDs(dominio, { flags, algorithm, key }, digestType = 2) {
+  const etiquetas = dominio.split('.').map((l) => Buffer.from([l.length, ...Buffer.from(l, 'ascii')]));
+  const wire = Buffer.concat([...etiquetas, Buffer.from([0])]);
+  const rdata = Buffer.alloc(4 + key.length);
+  rdata.writeUInt16BE(flags, 0);
+  rdata[2] = 3;
+  rdata[3] = algorithm;
+  key.copy(rdata, 4);
+  const hash = { 1: 'sha1', 2: 'sha256', 4: 'sha384' }[digestType] || 'sha256';
+  return crypto.createHash(hash).update(Buffer.concat([wire, rdata])).digest();
 }
 
 /** Un dominio que resuelve bien en todo, como punto de partida. */
@@ -224,8 +240,8 @@ test('detecta que el nombre existe pero no resuelve a ninguna direccion', async 
 });
 
 test('avisa cuando hay IPv4 pero no IPv6, y lo distingue de un error', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
-  const solo4 = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso({ ...baseSana(), AAAA: ok([]) }, { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
+  const solo4 = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso({ ...baseSana(), AAAA: ok([]) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) });
 
   hallazgo(r, 'IPv4 e IPv6');
   sinHallazgo(r, 'Sin IPv6');
@@ -236,7 +252,7 @@ test('avisa cuando hay IPv4 pero no IPv6, y lo distingue de un error', async () 
 test('un dominio sin correo da informacion, no un aviso', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso({ ...baseSana(), MX: ok([]) }, { dmarc: ok([['v=DMARC1; p=none']]) }) }
+    { dns: dnsFalso({ ...baseSana(), MX: ok([]) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
   );
   assert.equal(hallazgo(r, 'Sin servidores de correo').severity, 'info', 'no tener MX es normal en un sitio web');
   sinHallazgo(r, 'Sin registro SPF');
@@ -277,7 +293,7 @@ test('avisa si el DMARC de verdad no esta', async () => {
 test('detecta un alias y explica que impide poner otros registros', async () => {
   const r = await dns.ejecutar(
     { dominio: 'www.ejemplo.com' },
-    { dns: dnsFalso({ ...baseSana(), CNAME: ok(['ejemplo.com']) }, { dmarc: ok([['v=DMARC1; p=none']]) }) }
+    { dns: dnsFalso({ ...baseSana(), CNAME: ok(['ejemplo.com']) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
   );
   const h = hallazgo(r, 'alias');
   assert.match(h.detail, /ejemplo\.com/);
@@ -287,7 +303,7 @@ test('detecta un alias y explica que impide poner otros registros', async () => 
 test('avisa de un TTL muy bajo pero no lo convierte en problema', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso({ ...baseSana(), A: ok(['93.184.216.34'], 30) }, { dmarc: ok([['v=DMARC1; p=none']]) }) }
+    { dns: dnsFalso({ ...baseSana(), A: ok(['93.184.216.34'], 30) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
   );
   assert.equal(hallazgo(r, 'TTL muy bajo').severity, 'info');
   assert.equal(r.status, 'pass');
@@ -302,7 +318,7 @@ test('avisa de SERVFAIL por separado de NXDOMAIN', async () => {
 test('avisa de la consulta agotada sin romper el resto del informe', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso({ A: ok(['93.184.216.34'], 300), MX: fallo('ETIMEDOUT', 'tiempo agotado') }, { dmarc: ok([['v=DMARC1; p=none']]) }) }
+    { dns: dnsFalso({ A: ok(['93.184.216.34'], 300), MX: fallo('ETIMEDOUT', 'tiempo agotado') }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
   );
   assert.equal(hallazgo(r, 'agotó').severity, 'warn');
   // El resto de la tabla se sigue mostrando: un registro que falla no puede
@@ -313,7 +329,7 @@ test('avisa de la consulta agotada sin romper el resto del informe', async () =>
 test('avisa si la IP no tiene PTR', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com', inversa: '192.0.2.1' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), ptr: [] }) }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]), ptr: [] }) }
   );
   assert.equal(hallazgo(r, 'no tiene PTR').severity, 'warn');
 
@@ -328,7 +344,7 @@ test('avisa si la IP no tiene PTR', async () => {
 test('muestra el PTR si la IP lo tiene', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com', inversa: '8.8.8.8' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), ptr: ['dns.google'] }) }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]), ptr: ['dns.google'] }) }
   );
   const fila = seccion(r, 'Resolución inversa').rows[0];
   assert.equal(fila[1], 'dns.google');
@@ -337,7 +353,7 @@ test('muestra el PTR si la IP lo tiene', async () => {
 });
 
 test('no dice nada de la inversa si no se pide', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   assert.ok(!r.sections.some((s) => s.title === 'Resolución inversa'));
   sinHallazgo(r, 'PTR');
 });
@@ -389,10 +405,10 @@ test('un SRV se puede consultar gracias al guion bajo', async () => {
 test('un DMARC se puede consultar a mano y sale bien', async () => {
   const r = await dns.ejecutar(
     { dominio: '_dmarc.ejemplo.com', tipos: 'TXT' },
-    { dns: dnsFalso({ TXT: ok([['v=DMARC1; p=none; sp=quarantine']]) }) }
+    { dns: dnsFalso({ TXT: ok([['v=DMARC1; p=reject; sp=quarantine']]) }) }
   );
   const fila = seccion(r, 'Registros').rows[0];
-  assert.equal(fila[1], 'v=DMARC1; p=none; sp=quarantine', 'el TXT se lee entero, no cortado');
+  assert.equal(fila[1], 'v=DMARC1; p=reject; sp=quarantine', 'el TXT se lee entero, no cortado');
 });
 
 /* ------------------------------------------------------------------ *
@@ -402,7 +418,7 @@ test('un DMARC se puede consultar a mano y sale bien', async () => {
 test('en el chequeo por defecto diagnostica un dominio firmado', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: dnssecSano() }) }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]), dnssec: dnssecSano() }) }
   );
 
   assert.equal(r.status, 'pass', `hallazgos: ${r.findings.map((f) => f.title).join(' ; ')}`);
@@ -422,7 +438,7 @@ test('en el chequeo por defecto diagnostica un dominio firmado', async () => {
 test('un dominio sin firmar es información, no un aviso ni un fallo', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: { DNSKEY: ok([]), DS: ok([]) } }) }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]), dnssec: { DNSKEY: ok([]), DS: ok([]) } }) }
   );
   assert.equal(r.status, 'pass');
   assert.equal(hallazgo(r, 'Sin DNSSEC').severity, 'info');
@@ -441,7 +457,7 @@ test('un DS sin clave publicada detrás es un fallo de verdad', async () => {
 test('firmado pero sin DS en la zona padre avisa', async () => {
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]), dnssec: { ...dnssecSano(), DS: ok([]) } }) }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]), dnssec: { ...dnssecSano(), DS: ok([]) } }) }
   );
   assert.equal(r.status, 'warn');
   assert.equal(hallazgo(r, 'sin DS en la zona padre').severity, 'warn');
@@ -459,6 +475,19 @@ test('un DS que no corresponde con ninguna DNSKEY es un fallo', async () => {
   assert.match(h.detail, /keyTag 2371/, 'y la clave que sí está publicada');
 });
 
+test('un DS con el keyTag correcto pero el digest de otra clave es un fallo', async () => {
+  const ksk = { flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 };
+  const ajeno = digestoDs('ejemplo.com', { ...ksk, key: Buffer.from('01', 'hex') });
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dnssec: { DNSKEY: ok([ksk]), DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest: ajeno, digestHex: ajeno.toString('hex') }]) } }) }
+  );
+  assert.equal(r.status, 'fail', 'el keyTag encaja pero el contenido no: la cadena se rompe igual');
+  const h = hallazgo(r, 'no coincide con el contenido de la clave');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /keyTag 2371/);
+});
+
 test('acortar los tipos no dispara la consulta DNSSEC', async () => {
   let llamadas = 0;
   const espia = dnsFalso({ TXT: ok([['v=DMARC1; p=reject; rua=mailto:a@ejemplo.com']]) });
@@ -472,16 +501,18 @@ test('acortar los tipos no dispara la consulta DNSSEC', async () => {
 });
 
 test('DNSKEY y DS se pueden pedir a mano y la cadena se sigue revisando', async () => {
+  const ksk = { flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 };
+  const digest = digestoDs('ejemplo.com', ksk);
   const r = await dns.ejecutar(
     { dominio: 'ejemplo.com', tipos: 'DNSKEY,DS' },
     {
       dns: dnsFalso(
         {
           ...baseSana(),
-          DNSKEY: ok([{ flags: 257, algorithm: 13, key: Buffer.from('00', 'hex'), keyTag: 2371 }]),
-          DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest: Buffer.alloc(32, 1) }])
+          DNSKEY: ok([ksk]),
+          DS: ok([{ keyTag: 2371, algorithm: 13, digestType: 2, digest, digestHex: digest.toString('hex') }])
         },
-        { dmarc: ok([['v=DMARC1; p=none']]) }
+        { dmarc: ok([['v=DMARC1; p=reject']]) }
       )
     }
   );
@@ -523,7 +554,7 @@ test('los registros DNSSEC se formatean en una línea legible', () => {
  * ------------------------------------------------------------------ */
 
 test('la tabla de registros muestra el TTL o un guion si no se conoce', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   const tabla = seccion(r, 'Registros');
 
   assert.equal(tabla.kind, K.TABLA);
@@ -557,7 +588,7 @@ test('los TXT se enlazan sin separador', async () => {
 });
 
 test('muestra la cabecera SOA con el serial', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   const soa = seccion(r, 'Cabecera SOA');
   const valor = (clave) => soa.items.find(([k]) => k === clave)[1];
 
@@ -568,12 +599,12 @@ test('muestra la cabecera SOA con el serial', async () => {
 });
 
 test('avisa si la zona no devuelve SOA', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso({ ...baseSana(), SOA: ok([]) }, { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso({ ...baseSana(), SOA: ok([]) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   assert.equal(hallazgo(r, 'no devuelve SOA').severity, 'warn');
 });
 
 test('el resumen cuenta lo encontrado', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   const valor = (etiqueta) => r.summary.find((s) => s.label === etiqueta)?.value;
 
   assert.equal(valor('Direcciones IPv4'), '1');
@@ -592,7 +623,7 @@ test('sin la casilla no se toca ningún otro resolver', async () => {
   const sueltos = [];
   const espia = {
     consultarLote: async (cs) => { enLote += cs.length; return cs.map((c) => ({ ...c, ...baseSana()[c.tipo] })); },
-    consultar: async (nombre, tipo, opts) => { sueltos.push({ nombre, tipo, opts }); return ok([['v=DMARC1; p=none']]); },
+    consultar: async (nombre, tipo, opts) => { sueltos.push({ nombre, tipo, opts }); return ok([['v=DMARC1; p=reject']]); },
     resolverPTR: async () => []
   };
   const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: espia });
@@ -616,7 +647,7 @@ test('diferencias de correo o de zona avisan, diferencias de dirección no', asy
     return {
       consultarLote: async (cs) => cs.map((c) => ({ ...c, ...baseSana()[c.tipo] })),
       consultar: async (nombre, tipo, opts) => {
-        if (nombre.startsWith('_dmarc.')) return ok([['v=DMARC1; p=none']]);
+        if (nombre.startsWith('_dmarc.')) return ok([['v=DMARC1; p=reject']]);
         return opts?.servers ? publico(tipo) : propio(tipo);
       },
       resolverPTR: async () => []
@@ -662,7 +693,7 @@ test('si los tres resolvers coinciden lo dice', async () => {
     {
       dns: {
         consultarLote: async (cs) => cs.map((c) => ({ ...c, ...baseSana()[c.tipo] })),
-        consultar: async (nombre, tipo) => (nombre.startsWith('_dmarc.') ? ok([['v=DMARC1; p=none']]) : baseSana()[tipo]),
+        consultar: async (nombre, tipo) => (nombre.startsWith('_dmarc.') ? ok([['v=DMARC1; p=reject']]) : baseSana()[tipo]),
         resolverPTR: async () => []
       }
     }
@@ -688,7 +719,7 @@ test('el orden de los registros no cuenta como diferencia', async () => {
       dns: {
         consultarLote: async (cs) => cs.map((c) => ({ ...c, ...baseSana()[c.tipo] })),
         consultar: async (nombre, tipo, opts) => {
-          if (nombre.startsWith('_dmarc.')) return ok([['v=DMARC1; p=none']]);
+          if (nombre.startsWith('_dmarc.')) return ok([['v=DMARC1; p=reject']]);
           return opts?.servers ? delPublico : delSistema;
         },
         resolverPTR: async () => []
@@ -991,7 +1022,7 @@ test('los cinco formatos renderizan un informe completo', async () => {
     {
       dns: {
         consultarLote: async (cs) => cs.map((c) => ({ ...c, ...baseSana()[c.tipo] })),
-        consultar: async (nombre, tipo) => (nombre.startsWith('_dmarc.') ? ok([['v=DMARC1; p=none']]) : baseSana()[tipo]),
+        consultar: async (nombre, tipo) => (nombre.startsWith('_dmarc.') ? ok([['v=DMARC1; p=reject']]) : baseSana()[tipo]),
         resolverPTR: async () => ['dns.ejemplo.com']
       }
     }
@@ -1019,13 +1050,106 @@ test('el log del contexto recibe la traza', async () => {
   const lineas = [];
   await dns.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }), log: { info: (m) => lineas.push(m), error: (m) => lineas.push(m), warn: (m) => lineas.push(m) } }
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }), log: { info: (m) => lineas.push(m), error: (m) => lineas.push(m), warn: (m) => lineas.push(m) } }
   );
   assert.ok(lineas.length >= 1, 'debe registrar algo');
   assert.ok(lineas.some((l) => /ejemplo\.com/.test(l)), 'la traza debe nombrar el dominio');
 });
 
 test('funciona sin contexto ni logger', async () => {
-  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) });
+  const r = await dns.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) });
   assert.equal(r.status, 'pass');
+});
+
+/* ------------------------------------------------------------------ *
+ * SPF y DMARC a fondo
+ * ------------------------------------------------------------------ */
+
+test('detecta un SPF que autoriza a todo el mundo (+all)', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso({ ...baseSana(), TXT: ok([['v=spf1 +all']]) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
+  );
+  assert.equal(r.status, 'fail', 'un +all invalida la proteccion, es un fallo');
+  const h = hallazgo(r, 'SPF mal configurado');
+  assert.match(h.detail, /\+all/);
+});
+
+test('detecta un SPF que supera el limite de diez consultas DNS', async () => {
+  const includes = Array.from({ length: 11 }, (_, i) => `include:_spf${i}.ejemplo.com`).join(' ');
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso({ ...baseSana(), TXT: ok([[`v=spf1 ${includes} -all`]]) }, { dmarc: ok([['v=DMARC1; p=reject']]) }) }
+  );
+  assert.equal(r.status, 'fail');
+  assert.match(hallazgo(r, 'SPF mal configurado').detail, /11 consultas/);
+});
+
+test('avisa de un DMARC que solo observa (p=none)', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=none']]) }) }
+  );
+  assert.equal(r.status, 'warn', 'p=none no rechaza nada: es un aviso, no un aprobado');
+  const h = hallazgo(r, 'DMARC mejorable');
+  assert.match(h.detail, /p=none/);
+});
+
+test('aconseja añadir rua a un DMARC que ya filtra', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject']]) }) }
+  );
+  const h = hallazgo(r, 'DMARC mejorable');
+  assert.equal(h.severity, 'info', 'rechazar ya protege: lo que falta son informes');
+  assert.match(h.detail, /rua/);
+});
+
+test('resume SPF y DMARC en una tabla', async () => {
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsFalso(baseSana(), { dmarc: ok([['v=DMARC1; p=reject; rua=mailto:a@ejemplo.com']]) }) }
+  );
+  const s = seccion(r, 'Correo (SPF y DMARC)');
+  const spf = s.rows.find((f) => f[0] === 'SPF');
+  const dmarc = s.rows.find((f) => f[0] === 'DMARC');
+  assert.equal(spf[2].tone, 'ok');
+  assert.equal(dmarc[2].tone, 'ok');
+  assert.equal(s.rows.find((f) => f[0] === 'Informes DMARC (rua)')[1], 'a@ejemplo.com');
+});
+
+/* ------------------------------------------------------------------ *
+ * HTTPS / SVCB (RFC 9460)
+ * ------------------------------------------------------------------ */
+
+test('un registro HTTPS anuncia HTTP/3 y sale en su tabla', async () => {
+  const svcb = {
+    prioridad: 1,
+    destino: '.',
+    params: [
+      { key: 1, nombre: 'alpn', valor: ['h3', 'h2'] },
+      { key: 4, nombre: 'ipv4hint', valor: ['104.16.132.229'] }
+    ]
+  };
+  const r = await dns.ejecutar(
+    { dominio: 'ejemplo.com', tipos: 'A,HTTPS' },
+    { dns: dnsFalso({ ...baseSana(), HTTPS: ok([svcb]) }) }
+  );
+
+  const h = hallazgo(r, 'Publica un registro HTTPS');
+  assert.equal(h.severity, 'info');
+  assert.match(h.detail, /HTTP\/3/);
+
+  const s = seccion(r, 'Servicios (HTTPS/SVCB)');
+  assert.deepEqual(s.columns, ['Prioridad', 'Destino', 'Parámetros']);
+  assert.equal(s.rows[0][0], '1');
+  assert.equal(s.rows[0][1], '.');
+  assert.match(s.rows[0][2], /alpn=h3,h2/);
+  assert.match(s.rows[0][2], /ipv4hint=104\.16\.132\.229/);
+});
+
+test('el registro HTTPS se formatea en una linea legible', async () => {
+  const { formatear } = dns._internas;
+  const svcb = { prioridad: 1, destino: 'svc.ejemplo.com', params: [{ key: 1, nombre: 'alpn', valor: ['h2'] }] };
+  assert.equal(formatear(svcb), '1 svc.ejemplo.com · alpn=h2');
 });

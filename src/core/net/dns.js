@@ -18,6 +18,7 @@
 const dns = require('node:dns').promises;
 const dgram = require('node:dgram');
 const net = require('node:net');
+const crypto = require('node:crypto');
 const dnsPacket = require('dns-packet');
 const { NetlabError, CODES, wrap } = require('../errors');
 
@@ -41,6 +42,16 @@ const MAX_UDP_PAYLOAD = 1200;
  * crudo (UDP con EDNS y bit DO, con caida a TCP si llega truncado).
  */
 const TIPOS_DNSSEC = ['DNSKEY', 'DS', 'RRSIG', 'NSEC', 'NSEC3', 'NSEC3PARAM'];
+
+/**
+ * Tipos de servicio (SVCB y HTTPS, RFC 9460).
+ *
+ * Node tampoco los resuelve, y `dns-packet` no trae decodificador, asi que se
+ * piden con el paquete crudo y la RDATA se interpreta aqui. Un registro HTTPS
+ * es lo que publica ALPN (h2, h3), puerto y pistas de direccion para un sitio:
+ * justo lo que hace falta para saber si un dominio ofrece HTTP/3.
+ */
+const TIPOS_SERVICIO = ['HTTPS', 'SVCB'];
 
 /**
  * Crea un resolver apuntando a servidores especificos, evitando la cache local.
@@ -203,6 +214,11 @@ async function consultar(nombre, tipo, options = {}) {
     return consultarDnssec(nombre, tipoNormalizado, { servers, timeout, reintentos });
   }
 
+  // HTTPS y SVCB tampoco: paquete crudo con la RDATA decodificada aqui.
+  if (TIPOS_SERVICIO.includes(tipoNormalizado)) {
+    return consultarServicio(nombre, tipoNormalizado, { servers, timeout });
+  }
+
   const metodo = METODOS[tipoNormalizado];
   if (!metodo) {
     throw new NetlabError(CODES.PARAM_INVALIDO, `Tipo de registro no soportado: ${tipo}.`, {
@@ -297,6 +313,53 @@ function keyTagDeDnsKey({ flags, algorithm, key }) {
   for (let i = 0; i < rdata.length; i++) ac += i % 2 ? rdata[i] : rdata[i] << 8;
   ac += (ac >> 16) & 0xffff;
   return ac & 0xffff;
+}
+
+/** Hash de cada tipo de digest de DS (RFC 4034 apartado 5.1.3). */
+const HASH_DS = { 1: 'sha1', 2: 'sha256', 4: 'sha384' };
+
+/**
+ * Pasa un nombre a su forma canonica de DNS (RFC 4034 apartado 6.2): etiquetas
+ * en minusculas, cada una precedida por su longitud, terminado en la raiz.
+ *
+ * @param {string} nombre
+ * @returns {Buffer}
+ */
+function nombreAWire(nombre) {
+  const etiquetas = String(nombre).replace(/\.$/, '').toLowerCase().split('.').filter(Boolean);
+  const partes = [];
+  for (const etiqueta of etiquetas) {
+    const bytes = Buffer.from(etiqueta, 'ascii');
+    partes.push(Buffer.from([bytes.length]), bytes);
+  }
+  partes.push(Buffer.from([0]));
+  return Buffer.concat(partes);
+}
+
+/**
+ * Calcula el digest de un DS a partir de una DNSKEY y el nombre de la zona.
+ *
+ * El digest cubre, en este orden: el nombre en forma canonica y la RDATA de la
+ * DNSKEY (flags, protocolo, algoritmo y clave). Compararlo con el digest que
+ * publica la zona padre es lo unico que demuestra que el DS y la clave encajan
+ * de verdad; que el keyTag coincida no basta.
+ *
+ * @param {{flags:number, algorithm:number, key:Buffer}} dnskey
+ * @param {string} nombre Nombre de la zona (propietario de la DNSKEY).
+ * @param {number} digestType Tipo de digest del DS (1, 2 o 4).
+ * @returns {string|null} Digest en hexadecimal, o null si el tipo no se soporta.
+ */
+function calcularDigestoDs(dnskey, nombre, digestType) {
+  const hash = HASH_DS[digestType];
+  if (!hash || !dnskey || !Buffer.isBuffer(dnskey.key)) return null;
+
+  const rdata = Buffer.alloc(4 + dnskey.key.length);
+  rdata.writeUInt16BE(dnskey.flags, 0);
+  rdata[2] = 3;
+  rdata[3] = dnskey.algorithm;
+  dnskey.key.copy(rdata, 4);
+
+  return crypto.createHash(hash).update(Buffer.concat([nombreAWire(nombre), rdata])).digest('hex');
 }
 
 /** Manda un paquete DNS por UDP y resuelve con el primer mensaje que llega. */
@@ -504,6 +567,205 @@ async function consultarDnssec(nombre, tipo, options = {}) {
   };
 }
 
+/** Numero de tipo wire de cada registro de servicio. */
+const NUMERO_TIPO_SERVICIO = { SVCB: 64, HTTPS: 65 };
+
+/** Nombre de cada clave de parametro SVCB. */
+const CLAVES_SVCB = {
+  0: 'mandatory',
+  1: 'alpn',
+  2: 'no-default-alpn',
+  3: 'port',
+  4: 'ipv4hint',
+  5: 'ech',
+  6: 'ipv6hint',
+  7: 'dohpath'
+};
+
+/** Formatea 16 octetos como una direccion IPv6. */
+function formatearIPv6(buffer) {
+  const grupos = [];
+  for (let i = 0; i < 16; i += 2) grupos.push(buffer.readUInt16BE(i).toString(16));
+  // Compacta la run mas larga de ceros con "::".
+  let mejorInicio = -1;
+  let mejorLargo = 0;
+  let inicio = -1;
+  for (let i = 0; i <= grupos.length; i++) {
+    if (i < grupos.length && grupos[i] === '0') {
+      if (inicio < 0) inicio = i;
+    } else if (inicio >= 0) {
+      const largo = i - inicio;
+      if (largo > mejorLargo) {
+        mejorLargo = largo;
+        mejorInicio = inicio;
+      }
+      inicio = -1;
+    }
+  }
+  if (mejorLargo < 2) return grupos.join(':');
+  const izq = grupos.slice(0, mejorInicio).join(':');
+  const der = grupos.slice(mejorInicio + mejorLargo).join(':');
+  return `${izq}::${der}`;
+}
+
+/** Decodifica el valor de una clave de parametro SVCB segun su tipo. */
+function decodificarParamSvcb(clave, valor) {
+  if (clave === 1) {
+    // alpn: lista de cadenas con prefijo de longitud.
+    const alpn = [];
+    let i = 0;
+    while (i < valor.length) {
+      const largo = valor[i];
+      i += 1;
+      alpn.push(valor.slice(i, i + largo).toString('ascii'));
+      i += largo;
+    }
+    return alpn;
+  }
+  if (clave === 2) return true;
+  if (clave === 3) return valor.length >= 2 ? valor.readUInt16BE(0) : null;
+  if (clave === 4) {
+    const ips = [];
+    for (let i = 0; i + 4 <= valor.length; i += 4) ips.push(`${valor[i]}.${valor[i + 1]}.${valor[i + 2]}.${valor[i + 3]}`);
+    return ips;
+  }
+  if (clave === 5) return `${valor.length} bytes (ECH)`;
+  if (clave === 6) {
+    const ips = [];
+    for (let i = 0; i + 16 <= valor.length; i += 16) ips.push(formatearIPv6(valor.slice(i, i + 16)));
+    return ips;
+  }
+  if (clave === 0) {
+    const claves = [];
+    for (let i = 0; i + 2 <= valor.length; i += 2) {
+      const n = valor.readUInt16BE(i);
+      claves.push(CLAVES_SVCB[n] || String(n));
+    }
+    return claves;
+  }
+  return valor.toString('utf8');
+}
+
+/**
+ * Decodifica la RDATA de un registro SVCB/HTTPS (RFC 9460).
+ *
+ * @param {Buffer} rdata
+ * @returns {{prioridad:number, destino:string, params:Array<{key,nombre,valor}>}|null}
+ */
+function decodificarSvcbRdata(rdata) {
+  if (!Buffer.isBuffer(rdata) || rdata.length < 3) return null;
+
+  const prioridad = rdata.readUInt16BE(0);
+  let offset = 2;
+
+  // El nombre destino no lleva compresion: RFC 9460 la prohibe aqui.
+  const etiquetas = [];
+  while (offset < rdata.length && rdata[offset] !== 0) {
+    const largo = rdata[offset];
+    offset += 1;
+    if (offset + largo > rdata.length) break;
+    etiquetas.push(rdata.slice(offset, offset + largo).toString('ascii'));
+    offset += largo;
+  }
+  offset += 1; // consume el octeto raiz
+
+  const params = [];
+  while (offset + 4 <= rdata.length) {
+    const clave = rdata.readUInt16BE(offset);
+    offset += 2;
+    const largo = rdata.readUInt16BE(offset);
+    offset += 2;
+    const valor = rdata.slice(offset, offset + largo);
+    offset += largo;
+    params.push({ key: clave, nombre: CLAVES_SVCB[clave] || `key${clave}`, valor: decodificarParamSvcb(clave, valor) });
+  }
+
+  return { prioridad, destino: etiquetas.join('.') || '.', params };
+}
+
+/**
+ * Consulta un registro HTTPS o SVCB hablando DNS por la red de forma directa.
+ *
+ * Mismo contrato que `consultar`, para que `consultarLote` lo trate igual.
+ *
+ * @param {string} nombre
+ * @param {string} tipo 'HTTPS' o 'SVCB'.
+ * @param {object} [options]
+ * @returns {Promise<{ok:boolean, valores:any[], ttl:number|null, error:string|null, codigo:string|null, codigoDns:string|null, ad:boolean}>}
+ */
+async function consultarServicio(nombre, tipo, options = {}) {
+  const { servers = RESOLVERS_PUBLICOS, timeout = 5000 } = options;
+  const tipoNormalizado = String(tipo).toUpperCase();
+  if (!TIPOS_SERVICIO.includes(tipoNormalizado)) {
+    throw new NetlabError(CODES.PARAM_INVALIDO, `Tipo de servicio no soportado: ${tipo}.`, {
+      remediation: `Tipos disponibles: ${TIPOS_SERVICIO.join(', ')}.`
+    });
+  }
+
+  const numero = NUMERO_TIPO_SERVICIO[tipoNormalizado];
+  const etiquetaTipo = `UNKNOWN_${numero}`;
+  const paquete = dnsPacket.encode({
+    type: 'query',
+    id: (Math.random() * 0xffff) | 0,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ name: nombre, type: etiquetaTipo }],
+    additionals: [{ type: 'OPT', name: '.', udpPayloadSize: MAX_UDP_PAYLOAD, flags: dnsPacket.DNSSEC_OK }]
+  });
+
+  let ultimoError = null;
+
+  for (const servidor of servers) {
+    try {
+      const contexto = `consultando ${tipoNormalizado} de ${nombre}`;
+      const udp = await conTimeout(consultarUdp(paquete, servidor), timeout, contexto);
+      let decodificado = dnsPacket.decode(udp);
+      if (decodificado.flags & dnsPacket.TRUNCATED_RESPONSE) {
+        const tcp = await conTimeout(consultarTcp(paquete, servidor), timeout, `${contexto} por TCP`);
+        decodificado = dnsPacket.decode(tcp);
+      }
+
+      const ad = decodificado.flag_ad === true;
+      const rcode = decodificado.rcode || 'NOERROR';
+      if (rcode !== 'NOERROR') {
+        return {
+          ok: false,
+          valores: [],
+          ttl: null,
+          error: `El servidor de nombres devolvió ${rcode}`,
+          codigo: 'RED',
+          codigoDns: RCODE_CODIGO[rcode] || null,
+          ad
+        };
+      }
+
+      const delTipo = (decodificado.answers || []).filter(
+        (a) => String(a.type) === etiquetaTipo && a.data != null
+      );
+      const valores = delTipo.map((a) => decodificarSvcbRdata(a.data)).filter(Boolean);
+      const ttls = delTipo.map((a) => a.ttl).filter((t) => typeof t === 'number');
+      let ttl = ttls.length ? Math.min(...ttls) : null;
+      if (ttl === null) {
+        const soa = (decodificado.authorities || []).find((a) => a.type === 'SOA');
+        if (soa) ttl = Math.min(soa.ttl, soa.data?.minttl ?? soa.ttl);
+      }
+
+      return { ok: true, valores, ttl, error: null, codigo: null, codigoDns: null, ad };
+    } catch (error) {
+      ultimoError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    valores: [],
+    ttl: null,
+    error: `No se pudo consultar ${tipoNormalizado} de ${nombre}: ${ultimoError?.message || 'sin respuesta'}`,
+    codigo: 'RED',
+    codigoDns: ultimoError?.code === 'TIMEOUT' ? 'ETIMEDOUT' : ultimoError?.code || null,
+    ad: false
+  };
+}
+
 /**
  * Consulta el TTL real de un nombre.
  *
@@ -566,6 +828,7 @@ module.exports = {
   consultar,
   consultarLote,
   consultarDnssec,
+  consultarServicio,
   consultarTTL,
   resolverPTR,
   crearResolver,
@@ -573,6 +836,10 @@ module.exports = {
   conTimeout,
   conReintento,
   keyTagDeDnsKey,
+  calcularDigestoDs,
+  nombreAWire,
+  decodificarSvcbRdata,
   TIPOS_DNSSEC,
+  TIPOS_SERVICIO,
   RESOLVERS_PUBLICOS
 };

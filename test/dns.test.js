@@ -317,3 +317,40 @@ test('consultarDnssec marca NXDOMAIN como ENOTFOUND', { skip: false }, async (t)
   assert.equal(r.codigoDns, 'ENOTFOUND');
   assert.deepEqual(r.valores, []);
 });
+
+/* ------------------------------------------------------------------ *
+ * SVCB / HTTPS (RFC 9460)
+ * ------------------------------------------------------------------ */
+
+test('decodificarSvcbRdata lee prioridad, destino y parametros', () => {
+  // RDATA real capturada de cloudflare.com: prioridad 1, destino raiz,
+  // alpn=h3,h2 y dos pistas IPv4.
+  const hex = '0001000001000602683302683200040008681084e5681085e5';
+  const r = dns.decodificarSvcbRdata(Buffer.from(hex, 'hex'));
+
+  assert.equal(r.prioridad, 1);
+  assert.equal(r.destino, '.');
+  const alpn = r.params.find((p) => p.nombre === 'alpn');
+  assert.deepEqual(alpn.valor, ['h3', 'h2']);
+  const ipv4 = r.params.find((p) => p.nombre === 'ipv4hint');
+  assert.deepEqual(ipv4.valor, ['104.16.132.229', '104.16.133.229']);
+});
+
+test('decodificarSvcbRdata admite un destino con nombre', () => {
+  // prioridad 0 (AliasMode) + "svc" + root + port=8443 (0x20fb).
+  const hex = '000003737663000003000220fb';
+  const r = dns.decodificarSvcbRdata(Buffer.from(hex, 'hex'));
+  assert.equal(r.prioridad, 0);
+  assert.equal(r.destino, 'svc');
+  assert.equal(r.params.find((p) => p.nombre === 'port').valor, 8443);
+});
+
+test('consultarServicio trae el HTTPS de un dominio grande', { skip: false }, async (t) => {
+  if (!(await haySalida())) return t.skip('sin salida a Internet');
+  const r = await dns.consultar('cloudflare.com', 'HTTPS', { timeout: 6000, reintentos: 1 });
+  assert.equal(r.ok, true, r.error);
+  assert.ok(r.valores.length > 0, 'cloudflare.com publica un registro HTTPS');
+  const alpn = r.valores[0].params.find((p) => p.nombre === 'alpn');
+  assert.ok(alpn.valor.includes('h3'), 'anuncia HTTP/3');
+});
+
