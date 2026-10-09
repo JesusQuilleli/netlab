@@ -13,6 +13,11 @@ web/dist/
 *.pem
 *.key
 
+# Excepción: el certificado autofirmado de las pruebas TLS. No es un secreto,
+# es un fixture que el test de tls-checker levanta en local, y sin versionarlo
+# la suite falla en cualquier clon limpio.
+!test/fixtures/tls/*.pem
+
 # Credenciales que alguien ha dejado en un .txt suelto. Las claves de Spamhaus
 # llegan asi, en un fichero que dice "Query Key" y el numero debajo, y no es un
 # sitio donde suene a secreto a simple vista.
