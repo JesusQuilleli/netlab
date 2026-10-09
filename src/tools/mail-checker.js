@@ -36,6 +36,7 @@ const { NetlabError, CODES } = require('../core/errors');
 const { redactDeep } = require('../core/redact');
 const dnsNet = require('../core/net/dns');
 const dnsbl = require('../core/net/dnsbl');
+const webMod = require('../core/net/web');
 const { normalizarDominio, normalizarTimeout } = require('../core/dominio');
 const { nombreDkim } = require('../core/mail/comun');
 const spfMod = require('../core/mail/spf');
@@ -49,7 +50,11 @@ const verificarMod = require('../core/mail/verificar');
 
 const ID = 'mail-checker';
 
-/** Pesos del modo dominio. Suman 10. */
+/**
+ * Pesos del modo dominio. Los principales suman 10; DANE solo entra cuando el
+ * dominio publica TLSA, y al reescalar sobre el máximo no cambia la nota del
+ * que no lo publica.
+ */
 const PESOS_DOMINIO = {
   resolucion: 0.5,
   mx: 1.0,
@@ -60,7 +65,8 @@ const PESOS_DOMINIO = {
   listas: 1.5,
   mtaSts: 0.5,
   tlsRpt: 0.5,
-  bimi: 0.5
+  bimi: 0.5,
+  dane: 0.5
 };
 
 /** Pesos del modo mensaje. Los principales suman 7.5; con el contenido, 9.5. */
@@ -161,6 +167,7 @@ async function ejecutar(params = {}, ctx = {}) {
   const log = ctx.log || null;
   const dns = ctx.dns || dnsNet;
   const blacklists = ctx.dnsbl || dnsbl;
+  const pedirWeb = ctx.web?.pedir || webMod.pedir;
   const timeout = normalizarTimeout(params.timeout);
 
   const result = createResult({
@@ -174,7 +181,7 @@ async function ejecutar(params = {}, ctx = {}) {
     if (params.analizarMensaje) {
       await modoMensaje(result, recogerMensaje(params), { dns, blacklists, timeout, log });
     } else {
-      await modoDominio(result, params, { dns, blacklists, timeout, log });
+      await modoDominio(result, params, { dns, blacklists, pedirWeb, fetchImpl: ctx.fetchImpl, timeout, log });
     }
     return finalize(result, inicio);
   } catch (error) {
@@ -238,7 +245,7 @@ function ipsDe(registro) {
  * ------------------------------------------------------------------ */
 
 async function modoDominio(result, params, entorno) {
-  const { dns, blacklists, timeout, log } = entorno;
+  const { dns, blacklists, pedirWeb, fetchImpl, timeout, log } = entorno;
 
   if (!String(params.dominio ?? '').trim()) {
     throw new NetlabError(CODES.ENTRADA_VACIA, 'No se indicó ningún dominio.', {
@@ -301,6 +308,10 @@ async function modoDominio(result, params, entorno) {
   const transporte = extensiones
     ? transporteMod.parsear({ mtaSts: registrosTxtDe(r('mtaSts')), tlsRpt: registrosTxtDe(r('tlsRpt')), bimi: registrosTxtDe(r('bimi')) })
     : null;
+  const politica = extensiones
+    ? await consultarPoliticaMtaSts(dominio, transporte?.mtaSts, { pedir: pedirWeb, fetchImpl, timeout, log })
+    : null;
+  const dane = await consultarDane(dns, servidores, timeout);
 
   // --- comprobaciones -------------------------------------------------------
   const checks = [
@@ -311,7 +322,8 @@ async function modoDominio(result, params, entorno) {
     checkDmarc(dmarc),
     checkPtr(servidores),
     checkListas(servidores, conListas, spfListas, dbl),
-    ...(extensiones ? [checkMtaSts(transporte.mtaSts), checkTlsRpt(transporte.tlsRpt), checkBimi(transporte.bimi)] : [])
+    ...(extensiones ? [checkMtaSts(transporte.mtaSts, politica), checkTlsRpt(transporte.tlsRpt), checkBimi(transporte.bimi)] : []),
+    checkDane(dane)
   ];
 
   pintarInforme(result, {
@@ -323,6 +335,7 @@ async function modoDominio(result, params, entorno) {
       [`${dominio}`, 'TXT (SPF)', spf.valor || '—', spf.presente ? 'ok' : 'warn'],
       [`_dmarc.${dominio}`, 'TXT (DMARC)', dmarc.valor || '—', dmarc.presente ? 'ok' : 'warn'],
       ...filasDkim(result.sections, dkim.registros, dominio),
+      ...filasTlsa(dane),
       ...filasDbl(dbl)
     ]),
     seccionesExtra: (result_) => {
@@ -332,8 +345,54 @@ async function modoDominio(result, params, entorno) {
       seccionDkim(result_, dkim, dominio);
       seccionDmarc(result_, dmarc);
       if (transporte) seccionTransporte(result_, transporte);
+      if (politica) seccionPoliticaMtaSts(result_, politica);
+      seccionDane(result_, dane);
     }
   });
+}
+
+/**
+ * Descarga y valida la politica MTA-STS (RFC 8461) cuando el dominio publica el
+ * registro `_mta-sts`. Sin registro no hay politica que aplicar: no se pide.
+ *
+ * Nunca lanza. Un fallo de red se convierte en un estado "inaccesible" para que
+ * el informe lo diga sin hundir la comprobacion.
+ *
+ * @param {string} dominio
+ * @param {object|null} registroMtaSts Resultado de `parsear` para `_mta-sts`.
+ * @param {object} opciones `pedir` (ha de respetar el contrato de `web.pedir`),
+ *   `fetchImpl`, `timeout`, `log`.
+ * @returns {Promise<object|null>}
+ */
+async function consultarPoliticaMtaSts(dominio, registroMtaSts, { pedir, fetchImpl, timeout, log } = {}) {
+  if (!registroMtaSts?.presente) return null;
+  const url = `https://mta-sts.${dominio}/.well-known/mta-sts.txt`;
+  try {
+    const respuesta = await pedir(new URL(url), { metodo: 'GET', timeoutMs: timeout, fetchImpl });
+    const texto = String(respuesta.cuerpo?.texto || '');
+    if (respuesta.estado !== 200 || !texto.trim()) {
+      return {
+        estado: 'no-servida',
+        url,
+        status: respuesta.estado,
+        policy: null,
+        errores: [`La política no se sirve en ${url} (HTTP ${respuesta.estado}).`],
+        avisos: []
+      };
+    }
+    const policy = transporteMod.parsearPoliticaMtaSts(texto);
+    return { estado: policy.valido ? 'ok' : 'invalida', url, status: respuesta.estado, policy, errores: policy.errores, avisos: policy.avisos };
+  } catch (error) {
+    log?.warn?.(`MTA-STS: no se pudo descargar la política de ${dominio}: ${error.message}`);
+    return {
+      estado: 'inaccesible',
+      url,
+      status: null,
+      policy: null,
+      errores: [`No se pudo descargar la política de ${url}: ${error.message}`],
+      avisos: []
+    };
+  }
 }
 
 /** Selectores a probar: los del usuario más los habituales. */
@@ -445,6 +504,56 @@ async function consultarIpSpf(blacklists, spf, { conListas, timeout }) {
     }
   }
   return salida;
+}
+
+/**
+ * Consulta los TLSA (DANE) de los servidores de correo del dominio.
+ *
+ * Solo los MX reales (los que tienen dirección y no son el destino implícito
+ * del propio dominio): el TLSA se cuelga del servidor, no del domino. Se
+ * limitan a los primeros para no consultar sin fin.
+ *
+ * @param {object} dns
+ * @param {object[]} servidores
+ * @param {number} timeout
+ * @returns {Promise<{hosts: Array<{host: string, registros: object[], estado: string}>, consultado: boolean}>}
+ */
+async function consultarDane(dns, servidores, timeout) {
+  const hosts = (servidores || [])
+    .filter((s) => s.direcciones.length && !s.implicito)
+    .slice(0, 4)
+    .map((s) => s.host);
+  if (!hosts.length) return { hosts: [], consultado: false };
+
+  const consultas = hosts.map((host) => ({ clave: `tlsa:${host}`, nombre: `_25._tcp.${host}`, tipo: 'TLSA' }));
+  const respuestas = indexar(await consultarMuchas(dns, consultas, timeout));
+
+  return {
+    consultado: true,
+    hosts: hosts.map((host) => {
+      const registro = respuestas.get(`tlsa:${host}`) || { ok: false, valores: [] };
+      const registros = (registro.ok ? registro.valores : []).map(normalizarTlsa).filter(Boolean);
+      const estado = registros.length
+        ? registros.some((t) => t.usage === 2 || t.usage === 3)
+          ? 'dane'
+          : registros.some((t) => t.usage === 0 || t.usage === 1)
+            ? 'pkix'
+            : 'dudoso'
+        : 'sin-tlsa';
+      return { host, registros, estado };
+    })
+  };
+}
+
+/** Pone un TLSA ya decodificado en la forma estable que usan las secciones. */
+function normalizarTlsa(dato) {
+  if (!dato || typeof dato !== 'object') return null;
+  return {
+    usage: Number(dato.usage) || 0,
+    selector: Number(dato.selector) || 0,
+    matchingType: Number(dato.matchingType) || 0,
+    certificate: String(dato.certificate || '')
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -780,12 +889,40 @@ function checkListas(servidores, conListas, spfListas, dbl) {
   });
 }
 
-function checkMtaSts(m) {
+function checkMtaSts(m, politica) {
   if (!m.presente) {
     return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'warn', detalle: 'Sin MTA-STS: tus correos pueden ser degradados de TLS a texto plano en el trayecto.', recomendacion: 'Publica "_mta-sts.tudominio" con "v=STSv1; id=..." y sirve la política en https://mta-sts.tudominio/.well-known/mta-sts.txt.' });
   }
-  const estado = m.errores.length ? 'error' : m.avisos.length ? 'warn' : 'ok';
-  return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado, detalle: m.errores.join(' ') || m.avisos.join(' ') || `Publicado (id=${m.id}).`, recomendacion: estado === 'ok' ? null : 'Revisa el registro MTA-STS.' });
+  if (m.errores.length) {
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'error', detalle: m.errores.join(' '), recomendacion: 'Revisa el registro MTA-STS.' });
+  }
+  if (!politica) {
+    const estado = m.avisos.length ? 'warn' : 'ok';
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado, detalle: m.avisos.join(' ') || `Publicado (id=${m.id}).`, recomendacion: estado === 'ok' ? null : 'Revisa el registro MTA-STS.' });
+  }
+
+  // La política descargada manda sobre lo que dice el registro DNS.
+  if (politica.estado === 'invalida') {
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'error', detalle: `La política servida en ${politica.url} no es válida: ${politica.errores.join(' ')}`, recomendacion: 'Corrige el texto de la política y vuelve a ejecutar.' });
+  }
+  if (politica.estado === 'no-servida' || politica.estado === 'inaccesible') {
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'warn', detalle: `El registro existe pero la política no se puede leer en ${politica.url}: ${politica.errores.join(' ')}`, recomendacion: 'Sirve la política en esa URL con HTTP 200: sin ella los receptores no aplican nada.' });
+  }
+  const texto = politica.policy;
+  if (texto.mode === 'testing') {
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'warn', detalle: 'Política MTA-STS descargada y válida, pero en modo "testing": solo observa, no obliga a TLS.', recomendacion: 'Cuando los informes estén limpios, cambia a "mode: enforce".' });
+  }
+  if (texto.mode === 'none') {
+    return puntuacion.check({ id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado: 'warn', detalle: 'Política MTA-STS descargada y válida, pero en modo "none": desactiva la protección.', recomendacion: 'Usa "mode: enforce" para que los receptores exijan TLS.' });
+  }
+  const avisos = [...(m.avisos || []), ...(politica.avisos || [])];
+  const estado = avisos.length ? 'warn' : 'ok';
+  const maxAge = texto.maxAge !== null && texto.maxAge !== undefined ? `, max_age ${texto.maxAge} s` : '';
+  return puntuacion.check({
+    id: 'mta-sts', categoria: 'Transporte', titulo: 'MTA-STS', peso: PESOS_DOMINIO.mtaSts, estado,
+    detalle: avisos.length ? avisos.join(' ') : `Política servida y válida (mode enforce${maxAge}).`,
+    recomendacion: avisos.length ? 'Revisa las advertencias de la política.' : null
+  });
 }
 
 function checkTlsRpt(t) {
@@ -802,6 +939,60 @@ function checkBimi(b) {
   }
   const estado = b.errores.length ? 'error' : b.avisos.length ? 'warn' : 'ok';
   return puntuacion.check({ id: 'bimi', categoria: 'Transporte', titulo: 'BIMI', peso: PESOS_DOMINIO.bimi, estado, detalle: b.errores.join(' ') || b.avisos.join(' ') || 'Registro BIMI completo.', recomendacion: estado === 'ok' ? null : 'Revisa el registro BIMI.' });
+}
+
+/** Nombre legible de cada uso de un TLSA. */
+const NOMBRES_USO_TLSA = { 0: 'PKIX-TA', 1: 'PKIX-EE', 2: 'DANE-TA', 3: 'DANE-EE' };
+
+function usoTlsa(usage) {
+  return NOMBRES_USO_TLSA[usage] || `uso ${usage}`;
+}
+
+/**
+ * DANE solo puntúa cuando el dominio publica al menos un TLSA: no es obligatorio,
+ * y un dominio sin TLSA no debe salir castigado por no usar una protección
+ * opcional (ni el máximo ni la nota cambian). Cuando sí se publica, lo publicado
+ * se juzga: usos DANE (2/3) bien, solo PKIX (0/1) avisa, valores fuera de rango fallan.
+ */
+function checkDane(dane) {
+  const conDatos = (dane?.hosts || []).filter((h) => h.registros.length);
+  if (!conDatos.length) return null;
+
+  const conDane = conDatos.filter((h) => h.estado === 'dane');
+  const soloPkix = conDatos.filter((h) => h.estado === 'pkix');
+  const dudoso = conDatos.filter((h) => h.estado === 'dudoso');
+  const base = { id: 'dane', categoria: 'DANE', titulo: 'DANE (TLSA) en los MX', peso: PESOS_DOMINIO.dane };
+
+  if (dudoso.length) {
+    return puntuacion.check({
+      ...base,
+      estado: 'error',
+      detalle: `TLSA con valores fuera de rango en: ${dudoso.map((h) => h.host).join(', ')}. Un uso fuera de 0-3 no lo aplica ningún receptor.`,
+      recomendacion: 'Corrige los TLSA para que usen los usos 3 (DANE-EE) o 2 (DANE-TA).'
+    });
+  }
+  if (!conDane.length) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: `Solo se publican TLSA de tipo PKIX (usos 0/1) en: ${soloPkix.map((h) => h.host).join(', ')}. Los usos 0/1 no son DANE: no fijan el certificado por cadena ni por anclaje.`,
+      recomendacion: 'Para DANE en SMTP usa el uso 3 (certificado exacto) o el 2 (ancla), con el hash SHA-256.'
+    });
+  }
+  if (soloPkix.length) {
+    return puntuacion.check({
+      ...base,
+      estado: 'warn',
+      detalle: `DANE en ${conDane.map((h) => h.host).join(', ')}, pero ${soloPkix.map((h) => h.host).join(', ')} solo publica TLSA PKIX (usos 0/1), que no son DANE.`,
+      recomendacion: 'Añade usos 3 o 2 en los TLSA que los tengan como 0/1.'
+    });
+  }
+  return puntuacion.check({
+    ...base,
+    estado: 'ok',
+    detalle: `DANE publicado: ${conDane.map((h) => `${h.host} (${h.registros.map((t) => usoTlsa(t.usage)).join(', ')})`).join('; ')}.`,
+    recomendacion: null
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -1138,6 +1329,8 @@ function pintarInforme(result, datos) {
     tone: evaluado.tone
   });
 
+  seccionDesglose(result, evaluado);
+
   addSection(result, {
     id: 'comprobaciones',
     title: 'Comprobaciones',
@@ -1301,6 +1494,121 @@ function filaTransporte(nombre, prefijo, dato) {
   if (!dato.presente) return [nombre, prefijo, { valor: 'No publicado', tone: 'warn' }, '—'];
   const estado = dato.errores.length ? 'bad' : dato.avisos.length ? 'warn' : 'ok';
   return [nombre, prefijo, { valor: dato.errores.length ? 'Inválido' : dato.avisos.length ? 'Con avisos' : 'OK', tone: estado }, dato.valor];
+}
+
+function seccionPoliticaMtaSts(result, politica) {
+  const items = [
+    ['URL', politica.url],
+    ['Estado', etiquetaPolitica(politica), tonoPolitica(politica)]
+  ];
+  if (politica.policy) {
+    const p = politica.policy;
+    items.push(['Versión', p.version || '—']);
+    items.push(['Modo', p.mode ?? '—', p.mode === 'enforce' ? 'ok' : p.mode ? 'warn' : 'neutral']);
+    items.push(['Servidores (mx)', p.mx.length ? p.mx.join(', ') : '—']);
+    items.push(['max_age', p.maxAge !== null && p.maxAge !== undefined ? `${p.maxAge} s` : '—']);
+  }
+  if (politica.errores.length) items.push(['Errores', politica.errores.join(' ')]);
+  if (politica.avisos.length) items.push(['Avisos', politica.avisos.join(' ')]);
+  addSection(result, {
+    id: 'politica-mta-sts',
+    title: 'Política MTA-STS',
+    description: 'El texto que se sirve en el bien conocido de MTA-STS (RFC 8461). Un registro sin política aplicable no obliga a los receptores a nada.',
+    kind: K.PARES,
+    items
+  });
+}
+
+function etiquetaPolitica(p) {
+  if (p.estado === 'ok') return 'Válida';
+  if (p.estado === 'invalida') return 'Inválida';
+  if (p.estado === 'no-servida') return p.status ? `No servida (HTTP ${p.status})` : 'No servida';
+  return 'Inaccesible';
+}
+
+function tonoPolitica(p) {
+  return p.estado === 'ok' ? 'ok' : 'bad';
+}
+
+function seccionDane(result, dane) {
+  if (!dane?.consultado || !dane.hosts.length) return;
+  addSection(result, {
+    id: 'dane',
+    title: 'DANE (TLSA) en los servidores de correo',
+    description: 'Los TLSA de "port 25" que publica cada MX. Sin publicar, los receptores no tienen con qué fijar el certificado de tu servidor.',
+    kind: K.TABLA,
+    columns: ['Servidor', 'Registros TLSA', 'Uso', 'Estado'],
+    anchoColumnas: [28, 13, 32, 15],
+    rows: dane.hosts.map((h) => [
+      h.host,
+      String(h.registros.length),
+      h.registros.length ? h.registros.map((t) => `${usoTlsa(t.usage)} ${t.selector}/${t.matchingType}`).join(', ') : '—',
+      { valor: etiquetaDane(h.estado), tone: tonoDane(h.estado) }
+    ])
+  });
+}
+
+function etiquetaDane(estado) {
+  if (estado === 'dane') return 'DANE activo';
+  if (estado === 'pkix') return 'Solo PKIX';
+  if (estado === 'dudoso') return 'Valores inválidos';
+  return 'Sin TLSA';
+}
+
+function tonoDane(estado) {
+  if (estado === 'dane') return 'ok';
+  if (estado === 'pkix' || estado === 'dudoso') return 'bad';
+  return 'warn';
+}
+
+/** Filas de "Registros y valores" para los TLSA encontrados. */
+function filasTlsa(dane) {
+  if (!dane?.consultado) return [];
+  const filas = [];
+  for (const h of dane.hosts) {
+    for (const t of h.registros.slice(0, 2)) {
+      filas.push([`_25._tcp.${h.host}`, 'TLSA', `${usoTlsa(t.usage)} ${t.selector} ${t.matchingType} ${t.certificate.slice(0, 24)}…`, h.estado]);
+    }
+  }
+  return filas;
+}
+
+/**
+ * Desglose de la nota por categoria: de un vistazo se ve de dónde se pierden
+ * los puntos, sin tener que recorrer la tabla de comprobaciones.
+ */
+function seccionDesglose(result, evaluado) {
+  const porCategoria = new Map();
+  for (const c of evaluado.checks) {
+    if (c.estado === 'no-evaluable') continue;
+    const categoria = c.categoria || 'Otras';
+    const grupo = porCategoria.get(categoria) || { max: 0, obtenidos: 0 };
+    const factor = c.estado === 'ok' ? 1 : c.estado === 'warn' ? 0.5 : 0;
+    grupo.max += c.peso;
+    grupo.obtenidos += c.peso * factor;
+    porCategoria.set(categoria, grupo);
+  }
+
+  addSection(result, {
+    id: 'desglose',
+    title: 'Desglose por categoría',
+    description: 'Dónde se ganan y se pierden los puntos, agrupado por categoría. Un aviso vale la mitad; un fallo, nada.',
+    kind: K.TABLA,
+    columns: ['Categoría', 'Puntos', 'Máximo', 'Estado'],
+    anchoColumnas: [22, 10, 10, 12],
+    rows: [...porCategoria.entries()]
+      .map(([categoria, g]) => ({ categoria, ...g }))
+      .sort((a, b) => b.max - b.obtenidos - (a.max - a.obtenidos) || b.max - a.max)
+      .map((g) => {
+        const perdido = g.max - g.obtenidos;
+        return [
+          g.categoria,
+          puntuacion.redondear(g.obtenidos, 2),
+          puntuacion.redondear(g.max, 2),
+          { valor: perdido === 0 ? 'OK' : perdido >= g.max / 2 ? 'Falla' : 'Revisar', tone: perdido === 0 ? 'ok' : perdido >= g.max / 2 ? 'bad' : 'warn' }
+        ];
+      })
+  });
 }
 
 function seccionCabeceras(result, mensaje) {
@@ -1550,6 +1858,10 @@ module.exports = {
     paramsSeguros,
     recogerMensaje,
     registrosTxtDe,
+    consultarDane,
+    consultarPoliticaMtaSts,
+    normalizarTlsa,
+    filasTlsa,
     CAMPOS
   }
 };

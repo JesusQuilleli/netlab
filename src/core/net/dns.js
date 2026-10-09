@@ -219,6 +219,11 @@ async function consultar(nombre, tipo, options = {}) {
     return consultarServicio(nombre, tipoNormalizado, { servers, timeout });
   }
 
+  // TLSA (DANE) tampoco lo resuelve Node: paquete crudo; dns-packet lo decodifica.
+  if (tipoNormalizado === 'TLSA') {
+    return consultarTlsa(nombre, { servers, timeout, reintentos });
+  }
+
   const metodo = METODOS[tipoNormalizado];
   if (!metodo) {
     throw new NetlabError(CODES.PARAM_INVALIDO, `Tipo de registro no soportado: ${tipo}.`, {
@@ -767,6 +772,86 @@ async function consultarServicio(nombre, tipo, options = {}) {
 }
 
 /**
+ * Consulta un registro TLSA hablando DNS por la red de forma directa.
+ *
+ * Node no expone TLSA, asi que se arma el paquete y se manda por UDP con EDNS;
+ * si la respuesta llega truncada se repite por TCP. Mismo contrato que
+ * `consultar`, para que `consultarLote` lo trate igual.
+ *
+ * @param {string} nombre Nombre a consultar (normalmente `_25._tcp.<servidor>`).
+ * @param {object} [options]
+ * @param {string[]} [options.servers]
+ * @param {number} [options.timeout=5000]
+ * @returns {Promise<{ok: boolean, valores: Array<{usage:number, selector:number, matchingType:number, certificate:string}>, ttl: number|null, error: string|null, codigo: string|null, codigoDns: string|null, ad: boolean}>}
+ *   `certificate` es el hash asociativo en base64. Nunca lanza.
+ */
+async function consultarTlsa(nombre, options = {}) {
+  const { servers = RESOLVERS_PUBLICOS, timeout = 5000 } = options;
+  const paquete = dnsPacket.encode({
+    type: 'query',
+    id: (Math.random() * 0xffff) | 0,
+    flags: dnsPacket.RECURSION_DESIRED,
+    questions: [{ name: nombre, type: 'TLSA' }],
+    additionals: [{ type: 'OPT', name: '.', udpPayloadSize: MAX_UDP_PAYLOAD, flags: dnsPacket.DNSSEC_OK }]
+  });
+
+  let ultimoError = null;
+
+  for (const servidor of servers) {
+    try {
+      const contexto = `consultando TLSA de ${nombre}`;
+      const udp = await conTimeout(consultarUdp(paquete, servidor), timeout, contexto);
+      let decodificado = dnsPacket.decode(udp);
+      if (decodificado.flags & dnsPacket.TRUNCATED_RESPONSE) {
+        const tcp = await conTimeout(consultarTcp(paquete, servidor), timeout, `${contexto} por TCP`);
+        decodificado = dnsPacket.decode(tcp);
+      }
+
+      const ad = decodificado.flag_ad === true;
+      const rcode = decodificado.rcode || 'NOERROR';
+      if (rcode !== 'NOERROR') {
+        return {
+          ok: false,
+          valores: [],
+          ttl: null,
+          error: `El servidor de nombres devolvió ${rcode}`,
+          codigo: 'RED',
+          codigoDns: RCODE_CODIGO[rcode] || null,
+          ad
+        };
+      }
+
+      const delTipo = (decodificado.answers || []).filter((a) => String(a.type).toUpperCase() === 'TLSA' && a.data != null);
+      const valores = delTipo.map((a) => ({
+        usage: Number(a.data.usage) || 0,
+        selector: Number(a.data.selector) || 0,
+        matchingType: Number(a.data.matchingType) || 0,
+        certificate: Buffer.isBuffer(a.data.certificate) ? a.data.certificate.toString('base64') : String(a.data.certificate || '')
+      }));
+      let ttl = delTipo.length ? Math.min(...delTipo.map((a) => a.ttl)) : null;
+      if (ttl === null) {
+        const soa = (decodificado.authorities || []).find((a) => a.type === 'SOA');
+        if (soa) ttl = Math.min(soa.ttl, soa.data?.minttl ?? soa.ttl);
+      }
+
+      return { ok: true, valores, ttl, error: null, codigo: null, codigoDns: null, ad };
+    } catch (error) {
+      ultimoError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    valores: [],
+    ttl: null,
+    error: `No se pudo consultar TLSA de ${nombre}: ${ultimoError?.message || 'sin respuesta'}`,
+    codigo: 'RED',
+    codigoDns: ultimoError?.code === 'TIMEOUT' ? 'ETIMEDOUT' : ultimoError?.code || null,
+    ad: false
+  };
+}
+
+/**
  * Consulta el TTL real de un nombre.
  *
  * Usa el resolvedor por defecto del sistema con `resolveAny` para leer la
@@ -829,6 +914,7 @@ module.exports = {
   consultarLote,
   consultarDnssec,
   consultarServicio,
+  consultarTlsa,
   consultarTTL,
   resolverPTR,
   crearResolver,

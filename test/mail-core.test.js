@@ -262,6 +262,53 @@ test('transporte: BIMI con logo http avisa y sin VMC también', () => {
   assert.ok(r.bimi.avisos.some((a) => /"a="/.test(a)));
 });
 
+test('transporte: una política MTA-STS en enforce con su MX es válida', () => {
+  const r = transporte.parsearPoliticaMtaSts('version: STSv1\nmode: enforce\nmx: mx1.ejemplo.com\nmx: mx2.ejemplo.com\nmax_age: 86400');
+  assert.equal(r.presente, true);
+  assert.equal(r.valido, true);
+  assert.equal(r.mode, 'enforce');
+  assert.deepEqual(r.mx, ['mx1.ejemplo.com', 'mx2.ejemplo.com']);
+  assert.equal(r.maxAge, 86400);
+  assert.equal(r.errores.length, 0);
+});
+
+test('transporte: una política MTA-STS sin mx ni version no vale', () => {
+  const r = transporte.parsearPoliticaMtaSts('mode: enforce\nmax_age: 86400');
+  assert.equal(r.valido, false);
+  assert.ok(r.errores.some((e) => /"version"/.test(e)), 'falta version');
+  assert.ok(r.errores.some((e) => /"mx"/.test(e)), 'falta mx');
+});
+
+test('transporte: una política MTA-STS con modo o max_age raros se avisa o falla', () => {
+  const modoRaro = transporte.parsearPoliticaMtaSts('version: STSv1\nmode: prohibido\nmx: mx1.ejemplo.com\nmax_age: 5');
+  assert.equal(modoRaro.valido, false);
+  assert.ok(modoRaro.errores.some((e) => /mode.*no es válido/.test(e)));
+
+  const maxLoco = transporte.parsearPoliticaMtaSts('version: STSv1\nmode: enforce\nmx: mx1.ejemplo.com\nmax_age: 99999999');
+  assert.equal(maxLoco.valido, false);
+  assert.ok(maxLoco.errores.some((e) => /31557600/.test(e)));
+
+  const sinMaxAge = transporte.parsearPoliticaMtaSts('version: STSv1\nmode: enforce\nmx: mx1.ejemplo.com');
+  assert.equal(sinMaxAge.valido, true);
+  assert.ok(sinMaxAge.avisos.some((a) => /max_age/.test(a)));
+});
+
+test('transporte: una política MTA-STS vacía no inventa un vale por silencio', () => {
+  const vacia = transporte.parsearPoliticaMtaSts('');
+  assert.equal(vacia.presente, false);
+  assert.equal(vacia.valido, false);
+  const soloComentarios = transporte.parsearPoliticaMtaSts('  \n# comentario\n');
+  assert.equal(soloComentarios.presente, false);
+  assert.equal(soloComentarios.valido, false);
+});
+
+test('transporte: una política MTA-STS con el separador "=" se lee igual', () => {
+  const r = transporte.parsearPoliticaMtaSts('version=STSv1\nmode=enforce\nmx=mx1.ejemplo.com\nmax_age=3600');
+  assert.equal(r.valido, true);
+  assert.equal(r.mode, 'enforce');
+  assert.equal(r.maxAge, 3600);
+});
+
 /* ------------------------------------------------------------------ *
  * Mensaje
  * ------------------------------------------------------------------ */

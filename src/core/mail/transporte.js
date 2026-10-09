@@ -90,4 +90,71 @@ function separarCorreos(bruto) {
     .filter(Boolean);
 }
 
-module.exports = { parsear };
+/**
+ * Interpreta el texto de una politica MTA-STS (RFC 8461) servida en
+ * https://mta-sts.<dominio>/.well-known/mta-sts.txt.
+ *
+ * Es puro: no descarga nada, el que llama hace el pedido y pasa aqui el texto.
+ *
+ * @param {string} [texto]
+ * @returns {{presente: boolean, valido: boolean, version: string|null, mode: string|null, mx: string[], maxAge: number|null, errores: string[], avisos: string[]}}
+ */
+function parsearPoliticaMtaSts(texto) {
+  const vacio = { presente: false, valido: false, version: null, mode: null, mx: [], maxAge: null, errores: [], avisos: [] };
+  if (!texto || !String(texto).trim()) {
+    vacio.errores.push('La política está vacía (o no se pudo leer).');
+    return vacio;
+  }
+
+  const campos = {};
+  for (const linea of String(texto).split(/\r?\n/)) {
+    const limpia = linea.replace(/#.*$/, '').trim();
+    if (!limpia) continue;
+    const m = limpia.match(/^([a-z0-9_]+)\s*[:=]\s*(.*)$/i);
+    if (!m) continue;
+    const clave = m[1].trim().toLowerCase();
+    const valor = m[2].trim();
+    if (!campos[clave]) campos[clave] = [];
+    campos[clave].push(valor);
+  }
+
+  const errores = [];
+  const avisos = [];
+
+  // Solo comentarios o líneas sin campos: es como si no hubiera política.
+  if (!Object.keys(campos).length) {
+    errores.push('No se encontró ningún campo de política en el texto servido.');
+    return { presente: false, valido: false, version: null, mode: null, mx: [], maxAge: null, errores, avisos };
+  }
+
+  const version = campos.version ? campos.version[0] : null;
+  if (!version) errores.push('Falta "version". Debe ser "STSv1".');
+  else if (version !== 'STSv1') errores.push(`"${version}" no es una versión de política MTA-STS válida (debe ser STSv1).`);
+  if (campos.version && campos.version.length > 1) avisos.push('Hay más de una línea "version".');
+
+  const mode = campos.mode ? campos.mode[0] : null;
+  if (!mode) errores.push('Falta "mode". Debe ser enforce, testing o none.');
+  else if (!['enforce', 'testing', 'none'].includes(mode)) errores.push(`"mode: ${mode}" no es válido (enforce, testing o none).`);
+
+  const mx = campos.mx || [];
+  if (!mx.length) errores.push('Falta "mx": la política debe listar al menos un servidor.');
+  for (const host of mx) {
+    if (!host || host === '*' || /\s/.test(host)) {
+      errores.push(`"mx: ${host}" no es un nombre de servidor válido.`);
+    }
+  }
+
+  const baremo = Number.parseFloat(campos.max_age ? campos.max_age[0] : '');
+  let maxAge = null;
+  if (campos.max_age && !Number.isFinite(baremo)) errores.push(`"max_age" no es un número: "${campos.max_age[0]}".`);
+  else if (campos.max_age) {
+    maxAge = baremo < 0 ? 0 : Math.round(baremo);
+    if (maxAge > 31557600) errores.push(`"max_age" (${maxAge}) supera el máximo de un año (31557600 s).`);
+  } else {
+    avisos.push('Falta "max_age"; por defecto el receptor usa 86400 s (1 día).');
+  }
+
+  return { presente: true, valido: errores.length === 0, version, mode, mx, maxAge, errores, avisos };
+}
+
+module.exports = { parsear, parsearPoliticaMtaSts };

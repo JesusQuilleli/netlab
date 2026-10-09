@@ -123,10 +123,36 @@ function zonaSana() {
   };
 }
 
+/** Texto por defecto de la política MTA-STS que sirve la web falsa. */
+const POLITICA_MTA_STS_SANA = 'version: STSv1\nmode: enforce\nmx: mx1.ejemplo.com\nmax_age: 86400\n';
+
+/**
+ * Web falsa: responde a `pedir` de MTA-STS como se le pida. Sin ella, un
+ * dominio con registro `_mta-sts` haría una petición real y la prueba saldría
+ * a Internet.
+ */
+function webMtaSts(config = {}) {
+  const cuerpo = config.cuerpo ?? POLITICA_MTA_STS_SANA;
+  const estado = config.estado ?? 200;
+  return {
+    pedir: async () => ({
+      estado,
+      ok: estado >= 200 && estado < 300,
+      cuerpo: { texto: cuerpo, truncado: false },
+      url: config.url || 'https://mta-sts.ejemplo.com/.well-known/mta-sts.txt',
+      motivo: '',
+      cabeceras: {},
+      destino: null,
+      ttfbMs: 10
+    })
+  };
+}
+
 function entornoSano(extra = {}) {
   return {
     dns: dnsMail(zonaSana(), { ptr: { '93.184.216.34': ['mx1.ejemplo.com'], ...(extra.ptr || {}) } }),
-    dnsbl: extra.dnsbl || dnsblFalso()
+    dnsbl: extra.dnsbl || dnsblFalso(),
+    web: webMtaSts()
   };
 }
 
@@ -293,7 +319,7 @@ test('un dominio con URL pegada se limpia y el objetivo guarda lo escrito', asyn
 test('varios SPF publicados son un fallo', async () => {
   const zonas = zonaSana();
   zonas['ejemplo.com'].TXT = ok([['v=spf1 -all'], ['v=spf1 include:otro.com -all']]);
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), web: webMtaSts() });
 
   assert.equal(r.status, 'fail');
   const h = hallazgo(r, 'SPF');
@@ -304,7 +330,7 @@ test('varios SPF publicados son un fallo', async () => {
 test('un SPF con "+all" es un fallo', async () => {
   const zonas = zonaSana();
   zonas['ejemplo.com'].TXT = ok([['v=spf1 +all']]);
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), web: webMtaSts() });
   assert.equal(r.status, 'fail');
   assert.match(hallazgo(r, 'SPF').detail, /CUALQUIER servidor/);
 });
@@ -312,7 +338,7 @@ test('un SPF con "+all" es un fallo', async () => {
 test('un DKIM revocado es un fallo', async () => {
   const zonas = zonaSana();
   zonas['default._domainkey.ejemplo.com'].TXT = ok([['v=DKIM1; k=rsa; p=']]);
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), web: webMtaSts() });
   assert.equal(r.status, 'fail');
   assert.match(hallazgo(r, 'DKIM').detail, /revocada|VACÍA/i);
 });
@@ -320,7 +346,7 @@ test('un DKIM revocado es un fallo', async () => {
 test('un DMARC con "p=none" es un aviso, no un fallo', async () => {
   const zonas = zonaSana();
   zonas['_dmarc.ejemplo.com'].TXT = ok([['v=DMARC1; p=none']]);
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), web: webMtaSts() });
 
   const h = hallazgo(r, 'DMARC');
   assert.equal(h.severity, 'warn');
@@ -330,7 +356,7 @@ test('un DMARC con "p=none" es un aviso, no un fallo', async () => {
 test('un "null MX" se reconoce y se explica', async () => {
   const zonas = zonaSana();
   zonas['ejemplo.com'].MX = ok([{ exchange: '.', priority: 0 }]);
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: {} }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: {} }), web: webMtaSts() });
 
   const h = hallazgo(r, 'Servidores de correo');
   assert.equal(h.severity, 'warn');
@@ -340,7 +366,7 @@ test('un "null MX" se reconoce y se explica', async () => {
 test('un MX que no resuelve es un fallo', async () => {
   const zonas = zonaSana();
   delete zonas['mx1.ejemplo.com'];
-  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: {} }) });
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, { dns: dnsMail(zonas, { ptr: {} }), web: webMtaSts() });
 
   assert.equal(r.status, 'fail');
   assert.match(hallazgo(r, 'Servidores de correo').detail, /Sin dirección/);
@@ -390,6 +416,165 @@ test('desactivar las listas negras las saca del cálculo', async () => {
   );
   assert.equal(r.status, 'pass');
   assert.ok(!r.sections.some((s) => s.title === 'Servidores de correo (MX)' && s.columns.includes('Listas negras')));
+});
+
+/* ------------------------------------------------------------------ *
+ * DANE y política MTA-STS
+ * ------------------------------------------------------------------ */
+
+test('un TLSA válido (DANE-EE) en el MX se reconoce y no rompe el 10', async () => {
+  const zonas = zonaSana();
+  zonas['_25._tcp.mx1.ejemplo.com'] = { TLSA: ok([{ usage: 3, selector: 1, matchingType: 1, certificate: 'YWJjZGVmZw==' }]) };
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso(), web: webMtaSts() }
+  );
+
+  assert.equal(r.status, 'pass', `hallazgos: ${r.findings.map((f) => f.title).join(' ; ')}`);
+  assert.equal(valorResumen(r, 'Puntuación'), '10.0 / 10');
+  sinHallazgo(r, 'DANE');
+
+  const sec = seccion(r, 'DANE (TLSA) en los servidores de correo');
+  assert.equal(sec.rows[0][0], 'mx1.ejemplo.com');
+  assert.equal(sec.rows[0][2], 'DANE-EE 1/1');
+
+  const comprobaciones = seccion(r, 'Comprobaciones');
+  assert.equal(comprobaciones.rows.length, 11, 'con DANE publicado entra la comprobación');
+  const fila = comprobaciones.rows.find((f) => f[0].includes('DANE'));
+  assert.equal(fila[2].valor, 'OK');
+  assert.equal(fila[3], '0.5/0.5');
+
+  const registros = seccion(r, 'Registros y valores encontrados');
+  assert.ok(registros.rows.some((f) => f[1] === 'TLSA'));
+});
+
+test('un TLSA solo con usos PKIX (0/1) no es DANE y avisa', async () => {
+  const zonas = zonaSana();
+  zonas['_25._tcp.mx1.ejemplo.com'] = { TLSA: ok([{ usage: 1, selector: 0, matchingType: 1, certificate: 'YWJj' }]) };
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso(), web: webMtaSts() }
+  );
+
+  const h = hallazgo(r, 'DANE');
+  assert.equal(h.severity, 'warn');
+  assert.match(h.detail, /usos 0\/1|PKIX/);
+
+  const sec = seccion(r, 'DANE (TLSA) en los servidores de correo');
+  assert.ok(sec.rows[0].some((c) => c && c.valor === 'Solo PKIX'));
+});
+
+test('sin TLSA el DANE se muestra como ausente sin restar nota', async () => {
+  const r = await mail.ejecutar({ dominio: 'ejemplo.com' }, entornoSano());
+  assert.equal(r.status, 'pass');
+  assert.equal(valorResumen(r, 'Puntuación'), '10.0 / 10');
+  sinHallazgo(r, 'DANE');
+
+  const comprobaciones = seccion(r, 'Comprobaciones');
+  assert.equal(comprobaciones.rows.length, 10, 'sin TLSA no entra la comprobación DANE');
+
+  const sec = seccion(r, 'DANE (TLSA) en los servidores de correo');
+  assert.ok(sec.rows[0].some((c) => c && c.valor === 'Sin TLSA'), 'la ausencia se ve, sin castigo');
+});
+
+test('una política MTA-STS inválida convierte MTA-STS en un fallo', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { ...entornoSano(), web: webMtaSts({ cuerpo: 'version: STSv1\nmode: enforce\nmax_age: 86400\n' }) }
+  );
+
+  assert.equal(r.status, 'fail');
+  const h = hallazgo(r, 'MTA-STS');
+  assert.equal(h.severity, 'error');
+  assert.match(h.detail, /no es válida/);
+
+  const sec = seccion(r, 'Política MTA-STS');
+  assert.ok(sec.items.some((f) => f[0] === 'Modo' && f[1] === 'enforce'));
+});
+
+test('una política que no se sirve (HTTP 404) avisa', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { ...entornoSano(), web: webMtaSts({ estado: 404, cuerpo: '' }) }
+  );
+
+  const h = hallazgo(r, 'MTA-STS');
+  assert.equal(h.severity, 'warn');
+  assert.match(h.detail, /404/);
+
+  const sec = seccion(r, 'Política MTA-STS');
+  assert.ok(sec.items.some((f) => f[0] === 'Estado' && /No servida/.test(String(f[1]))));
+});
+
+test('una política en modo testing avisa pero la estructura vale', async () => {
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { ...entornoSano(), web: webMtaSts({ cuerpo: 'version: STSv1\nmode: testing\nmx: mx1.ejemplo.com\nmax_age: 86400\n' }) }
+  );
+
+  const h = hallazgo(r, 'MTA-STS');
+  assert.equal(h.severity, 'warn');
+  assert.match(h.detail, /testing/);
+});
+
+test('el desglose por categoría agrega los puntos perdidos', async () => {
+  const zonas = zonaSana();
+  zonas['_dmarc.ejemplo.com'].TXT = ok([['v=DMARC1; p=none']]);
+  const r = await mail.ejecutar(
+    { dominio: 'ejemplo.com' },
+    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso(), web: webMtaSts() }
+  );
+
+  const desglose = seccion(r, 'Desglose por categoría');
+  const dmarc = desglose.rows.find((f) => f[0] === 'DMARC');
+  assert.ok(dmarc, 'aparece la categoría DMARC');
+  assert.equal(dmarc[1], 0.75, 'un warn vale la mitad');
+  assert.equal(dmarc[2], 1.5);
+});
+
+test('consultarPoliticaMtaSts solo pide cuando existe el registro y nunca lanza', async () => {
+  const { consultarPoliticaMtaSts } = mail._internas;
+
+  const sinRegistro = await consultarPoliticaMtaSts('ejemplo.com', null, {
+    pedir: async () => { throw new Error('no debería llamarse'); }
+  });
+  assert.equal(sinRegistro, null);
+
+  let llamado = false;
+  const r = await consultarPoliticaMtaSts('ejemplo.com', { presente: true, id: 'x' }, {
+    pedir: async () => {
+      llamado = true;
+      return { estado: 200, cuerpo: { texto: POLITICA_MTA_STS_SANA } };
+    }
+  });
+  assert.equal(llamado, true);
+  assert.equal(r.estado, 'ok');
+  assert.equal(r.policy.mode, 'enforce');
+
+  const roto = await consultarPoliticaMtaSts('ejemplo.com', { presente: true }, {
+    pedir: async () => { throw new Error('conexión caída'); }
+  });
+  assert.equal(roto.estado, 'inaccesible');
+  assert.ok(roto.errores.some((e) => /conexión caída/.test(e)));
+});
+
+test('consultarDane trae el estado de cada MX y normaliza el TLSA', async () => {
+  const { consultarDane } = mail._internas;
+  const dns = dnsMail({
+    '_25._tcp.mx1.ejemplo.com': { TLSA: ok([{ usage: 3, selector: 1, matchingType: 1, certificate: 'YWJj' }]) },
+    '_25._tcp.mx2.ejemplo.com': { TLSA: fallo('ENODATA') }
+  });
+  const servidores = [
+    { host: 'mx1.ejemplo.com', direcciones: ['93.184.216.34'] },
+    { host: 'mx2.ejemplo.com', direcciones: ['93.184.216.35'] },
+    { host: '(implícito)', direcciones: ['93.184.216.36'], implicito: true }
+  ];
+  const r = await consultarDane(dns, servidores, 5000);
+  assert.equal(r.consultado, true);
+  assert.equal(r.hosts.length, 2, 'el implícito se descarta');
+  assert.equal(r.hosts[0].estado, 'dane');
+  assert.equal(r.hosts[0].registros[0].usage, 3);
+  assert.equal(r.hosts[1].estado, 'sin-tlsa');
 });
 
 /* ------------------------------------------------------------------ *
@@ -573,7 +758,7 @@ test('una IP autorizada por el SPF y listada es un fallo', async () => {
   zonas['ejemplo.com'].TXT = ok([['v=spf1 ip4:198.51.100.7 -all']]);
   const r = await mail.ejecutar(
     { dominio: 'ejemplo.com' },
-    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso({ listadas: ['198.51.100.7'] }) }
+    { dns: dnsMail(zonas, { ptr: { '93.184.216.34': ['mx1.ejemplo.com'] } }), dnsbl: dnsblFalso({ listadas: ['198.51.100.7'] }), web: webMtaSts() }
   );
 
   assert.equal(r.status, 'fail');
